@@ -28,9 +28,23 @@ class Signalformer(nn.Module):
     Pipeline:
 
     input (N, C, L)
-    -> SignalTokenizer   (N, L, d_model)                 decomposition, feature gate, conv, time features
-    -> SignalEncoder     (N, L, d_model) = memory        causal self-attention blocks
+    -> SignalTokenizer   (N, T, d_model)                 decomposition, feature gate, conv, time features
+    -> SignalEncoder     (N, T, d_model) = memory        causal self-attention blocks
     -> SignalDecoder     (N, out_channels, output_length) learnable queries, cross-attention, output head
+
+    T = L when conv_stride = 1. With conv_stride = s > 1, each token summarizes a patch of input steps and
+    T = ceil(L / s), which shortens the sequence the attention layers see (patching).
+
+    revin=True wraps the model in reversible instance normalization: each input window is normalized with its
+    own per-signal mean and std, and the forecast is mapped back with the same statistics. It only uses the
+    input window, so it stays causal, and it lets the model follow level shifts between training and test
+    periods. It requires out_channels == in_channels (the forecast targets are the input signals).
+
+    channel_independent=True runs every signal through the whole model as its own univariate series (as in
+    PatchTST): (N, C, L) is reshaped to (N * C, 1, L), all weights are shared across signals, and signals never
+    interact. This removes the bottleneck of compressing many signals into one d_model token, at the cost of
+    ignoring cross-signal information and running C times as many sequences. It requires
+    out_channels == in_channels. The L0 gate then selects frequency bands shared by all signals.
 
     Training: add the gate penalty to the loss, e.g. loss = task_loss + lam * model.penalty().
     """
@@ -52,9 +66,22 @@ class Signalformer(nn.Module):
         out_channels: int = 1,
         samples_per_output: int = 1,
         text_dim: int = 0,
+        conv_stride: int = 1,
+        cross_channel: bool = True,
+        revin: bool = False,
+        channel_independent: bool = False,
     ):
         super().__init__()
-        self.tokenizer = SignalTokenizer(in_channels, d_model, kernel_size, ma_windows, n_rank, time_dim)
+        if revin:
+            assert out_channels == in_channels, "revin requires out_channels == in_channels"
+        if channel_independent:
+            assert out_channels == in_channels, "channel_independent requires out_channels == in_channels"
+            in_channels = out_channels = 1  # every submodule sees one signal at a time
+        self.channel_independent = channel_independent
+        self.revin = RevIN(in_channels) if revin else None
+        self.tokenizer = SignalTokenizer(
+            in_channels, d_model, kernel_size, ma_windows, n_rank, time_dim, conv_stride, cross_channel
+        )
         self.encoder = SignalEncoder(d_model, num_heads, num_encoder_layers, dropout)
         self.decoder = SignalDecoder(
             d_model,
@@ -83,23 +110,90 @@ class Signalformer(nn.Module):
             assert time_features is not None and future_time_features is not None, (
                 "time_features and future_time_features are required when time_dim > 0"
             )
-        tokens = self.tokenizer(input, time_features)  # (N, L, d_model)
-        memory = self.encoder(tokens)  # (N, L, d_model)
+        batch, num_signals = input.shape[:2]
+        if self.channel_independent:
+            # (N, C, L) -> (N * C, 1, L); per-sample inputs are repeated for each of its signals
+            input = input.reshape(batch * num_signals, 1, -1)
+            repeat = lambda t: None if t is None else t.repeat_interleave(num_signals, dim=0)  # noqa: E731
+            time_features, future_time_features = repeat(time_features), repeat(future_time_features)
+            text_memory, text_padding_mask = repeat(text_memory), repeat(text_padding_mask)
+        stats = None
+        if self.revin is not None:
+            input, stats = self.revin.normalize(input)
+        tokens = self.tokenizer(input, time_features)  # (N, T, d_model)
+        memory = self.encoder(tokens)  # (N, T, d_model)
         future_time = self.tokenizer.embed_time(future_time_features) if future_time_features is not None else None
-        return self.decoder(memory, future_time, text_memory, text_padding_mask)  # (N, out_channels, output_length)
+        # Positions in input-time units: token j ends at input step memory_offset + j * memory_stride, and the
+        # first forecast step is input step L.
+        input_len = input.size(-1)
+        memory_offset, memory_stride = self.tokenizer.token_positions(input_len)
+        output = self.decoder(
+            memory,
+            future_time,
+            text_memory,
+            text_padding_mask,
+            query_offset=input_len,
+            memory_offset=memory_offset,
+            memory_stride=memory_stride,
+        )  # (N, out_channels, output_length)
+        if self.revin is not None and stats is not None:
+            output = self.revin.denormalize(output, stats)
+        if self.channel_independent:
+            output = output.reshape(batch, num_signals, -1)
+        return output
 
     def penalty(self) -> torch.Tensor:
         return self.tokenizer.penalty()
 
 
+class RevIN(nn.Module):
+    """Reversible instance normalization (Kim et al., 2022) over the time axis of each input window.
+
+    normalize() returns the statistics instead of storing them, so the module holds no per-batch state.
+    The optional affine weight and bias are learned per signal.
+    """
+
+    def __init__(self, num_channels: int, eps: float = 1e-5, affine: bool = True) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_channels)) if affine else None
+        self.bias = nn.Parameter(torch.zeros(num_channels)) if affine else None
+
+    def normalize(self, input: torch.Tensor) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        # input: (N, C, L); statistics over the window's own time axis only, so no future data is used
+        mean = input.mean(dim=-1, keepdim=True)
+        std = (input.var(dim=-1, keepdim=True, unbiased=False) + self.eps).sqrt()
+        x = (input - mean) / std
+        if self.weight is not None and self.bias is not None:
+            x = x * self.weight.view(1, -1, 1) + self.bias.view(1, -1, 1)
+        return x, (mean, std)
+
+    def denormalize(self, output: torch.Tensor, stats: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        # output: (N, C, H)
+        mean, std = stats
+        if self.weight is not None and self.bias is not None:
+            output = (output - self.bias.view(1, -1, 1)) / (self.weight.view(1, -1, 1) + self.eps)
+        return output * std + mean
+
+
 class SignalTokenizer(nn.Module):
-    """Turns raw signals into a sequence of d_model tokens, one per time step (causal).
+    """Turns raw signals into a sequence of d_model tokens (causal).
 
     input (N, C, L)
     -> MultiScaleDecomp         (N, B*C, L)     B = len(ma_windows) + 1 frequency bands
     -> L0Gate                   (N, B*C, L)     feature selection
-    -> LowRankCausalConv1d+GELU (N, d_model, L)
-    -> transpose (+ time features, which bypass the conv)  (N, L, d_model)
+    -> LowRankCausalConv1d+GELU (N, d_model, T)
+    -> transpose (+ time features, which bypass the conv)  (N, T, d_model)
+
+    conv_stride = s: one token per s input steps (patching), T = ceil(L / s). Token j covers the input steps
+    ending at token_positions(L)[0] + j * s, so the last token always ends at the last input step. kernel_size
+    must be >= conv_stride, otherwise some input steps would fall between kernels and never be seen. With long
+    patches raise n_rank: each channel's patch is compressed to n_rank numbers before channels are mixed, so
+    n_rank = 1 keeps only one weighted average per patch, while n_rank >= kernel_size loses nothing.
+
+    cross_channel = False: the 1x1 channel conv only mixes the bands of the same signal (grouped by signal),
+    keeping signals independent inside the tokenizer. Each signal then owns d_model / C dimensions of the
+    token, so d_model must be divisible by C. Signals still interact later through attention.
     """
 
     def __init__(
@@ -110,16 +204,36 @@ class SignalTokenizer(nn.Module):
         ma_windows: tuple[int, ...] = (5, 20, 60),
         n_rank: int = 1,
         time_dim: int = 0,
+        conv_stride: int = 1,
+        cross_channel: bool = True,
     ) -> None:
         super().__init__()
+        assert conv_stride >= 1, "conv_stride must be >= 1"
+        assert kernel_size >= conv_stride, "kernel_size must be >= conv_stride so every input step is covered"
+        if not cross_channel:
+            assert d_model % in_channels == 0, "d_model must be divisible by in_channels when cross_channel=False"
+        self.in_channels = in_channels
+        self.conv_stride = conv_stride
+        self.cross_channel = cross_channel
         self.decomp = MultiScaleDecomp(ma_windows)
         decomp_channels = self.decomp.num_bands * in_channels  # each signal is split into num_bands bands
         self.gate = L0Gate(decomp_channels)
-        self.conv = LowRankCausalConv1d(decomp_channels, d_model, kernel_size, n_rank)
+        self.conv = LowRankCausalConv1d(
+            decomp_channels,
+            d_model,
+            kernel_size,
+            n_rank,
+            stride=conv_stride,
+            channel_groups=1 if cross_channel else in_channels,
+        )
         # Time features (e.g. calendar encodings) bypass the conv; they are projected to d_model and added to
         # the tokens. The projection is shared with the decoder's future time features (via embed_time) so the
         # same date means the same thing on both sides. time_dim=0 disables them.
         self.time_proj = nn.Linear(time_dim, d_model) if time_dim > 0 else None
+
+    def token_positions(self, length: int) -> tuple[int, int]:
+        """(offset, stride) such that token j ends at input step offset + j * stride."""
+        return (length - 1) % self.conv_stride, self.conv_stride
 
     def embed_time(self, time_features: torch.Tensor) -> torch.Tensor:  # (N, L, time_dim) -> (N, L, d_model)
         assert self.time_proj is not None, "time features given but time_dim == 0"
@@ -138,11 +252,17 @@ class SignalTokenizer(nn.Module):
         #   scaling such as (year - base) / 10 or Time2Vec.
         # - Future time features (decoder side) may only contain information known in advance; anything only
         #   observed on that day leaks the future.
-        x = self.gate(self.decomp(input))  # (N, B*C, L)
-        x = F.gelu(self.conv(x))  # (N, d_model, L)
-        x = x.transpose(1, 2)  # (N, L, d_model)
+        x = self.gate(self.decomp(input))  # (N, B*C, L), band-major
+        if not self.cross_channel:
+            # Grouped channel conv needs each signal's bands to be contiguous: band-major -> signal-major
+            n, _, length = x.shape
+            x = x.view(n, -1, self.in_channels, length).transpose(1, 2).reshape(n, -1, length)
+        x = F.gelu(self.conv(x))  # (N, d_model, T)
+        x = x.transpose(1, 2)  # (N, T, d_model)
         if time_features is not None:
-            x = x + self.embed_time(time_features)
+            # Use the time features of the last input step each token covers
+            offset, stride = self.token_positions(input.size(-1))
+            x = x + self.embed_time(time_features[:, offset::stride])
         return x
 
     def penalty(self) -> torch.Tensor:
@@ -208,8 +328,13 @@ class SignalDecoder(nn.Module):
         future_time: torch.Tensor | None = None,
         text_memory: torch.Tensor | None = None,
         text_padding_mask: torch.Tensor | None = None,
+        query_offset: int | None = None,
+        memory_offset: int = 0,
+        memory_stride: int = 1,
     ) -> torch.Tensor:
-        # memory: (N, L, d_model) from the encoder
+        # memory: (N, T, d_model) from the encoder
+        # Positions for RoPE, in input-time units: memory token j sits at memory_offset + j * memory_stride and
+        # decoder query k at query_offset + k. query_offset defaults to T (memory at stride 1).
         # future_time: (N, output_length * samples_per_output, d_model), already embedded future time features
         # text_memory: (N, L_text, text_dim), embeddings from an external (e.g. frozen pretrained) text encoder.
         # text_padding_mask: (N, L_text) bool, True marks padding to ignore (nn.MultiheadAttention convention).
@@ -227,9 +352,18 @@ class SignalDecoder(nn.Module):
         y = self.queries.expand(memory.size(0), -1, -1)  # (N, output_length * s, d_model)
         if future_time is not None:
             y = y + future_time
+        if query_offset is None:
+            query_offset = memory.size(1)
         for block in self.blocks:
-            # future step k sits at position L + k
-            y = block(y, memory, offset=memory.size(1), text_memory=text_memory, text_padding_mask=text_padding_mask)
+            y = block(
+                y,
+                memory,
+                offset=query_offset,
+                memory_offset=memory_offset,
+                memory_stride=memory_stride,
+                text_memory=text_memory,
+                text_padding_mask=text_padding_mask,
+            )
         y = self.norm(y)
         n, l_dec, d = y.shape
         y = y.reshape(n, l_dec // self.samples_per_output, self.samples_per_output * d)  # (N, output_length, s * d)
@@ -245,25 +379,39 @@ class LowRankCausalConv1d(nn.Module):
     The rank is capped at min(kernel_size, out_channels); n_rank >= kernel_size is as expressive as a full
     Conv1d, so larger values only add parameters.
     Do not insert an activation between the two convs, otherwise it is no longer a low-rank factorization.
+    stride > 1 makes the time conv emit one output per stride input steps (see CausalConv1d).
+    channel_groups > 1 splits the channel mixing into independent groups of consecutive input channels.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, n_rank: int = 1) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        n_rank: int = 1,
+        stride: int = 1,
+        channel_groups: int = 1,
+    ) -> None:
         super().__init__()
+        assert in_channels % channel_groups == 0 and out_channels % channel_groups == 0, (
+            "in_channels and out_channels must be divisible by channel_groups"
+        )
         # groups=in_channels: depthwise, each channel is convolved along time independently, no channel mixing
         self.time_conv = CausalConv1d(
             in_channels=in_channels,
             out_channels=in_channels * n_rank,
             kernel_size=kernel_size,
+            stride=stride,
             groups=in_channels,
         )
-        # kernel_size=1: mixes all channels at each time step only (equivalent to a per-step Linear), so it
+        # kernel_size=1: mixes channels at each time step only (equivalent to a per-step Linear), so it
         # is causal by construction. Transposing to (N, L, C) instead would treat time steps as channels and
         # mix in the future.
-        self.channel_conv = nn.Conv1d(in_channels * n_rank, out_channels, kernel_size=1)
+        self.channel_conv = nn.Conv1d(in_channels * n_rank, out_channels, kernel_size=1, groups=channel_groups)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C_in, L)
-        x = self.time_conv(input)  # (N, C_in * n_rank, L)
-        return self.channel_conv(x)  # (N, C_out, L)
+        x = self.time_conv(input)  # (N, C_in * n_rank, T)
+        return self.channel_conv(x)  # (N, C_out, T)
 
 
 class MultiScaleDecomp(nn.Module):
@@ -308,8 +456,9 @@ class L0Gate(nn.Module):
     """Hard Concrete gate (Louizos et al., 2018): learns a per-channel weight that can be exactly 0.
 
     - Standardize inputs first, otherwise gate values reflect feature scale rather than importance.
-    - Tune the penalty weight lam: too large closes every gate, too small has no effect. Start with the
-      penalty at roughly 1-10% of the task loss.
+    - penalty() is the expected fraction of open channels (0 to 1), so lam means the same thing for any number
+      of channels. Too large closes every gate, too small has no effect; lam around 1e-2 is a starting point
+      for a z-scored MSE loss.
     - Consider a separate optimizer param group for log_alpha (higher lr, weight_decay=0) so AdamW weight
       decay does not interfere with the penalty.
     - Highly correlated features (e.g. 5-day and 10-day MAs) may be picked arbitrarily; check that the
@@ -340,9 +489,9 @@ class L0Gate(nn.Module):
         return input * self.gate_values().view(1, -1, 1)
 
     def penalty(self) -> torch.Tensor:
-        """Expected number of open channels (differentiable approximation of L0)."""
+        """Expected fraction of open channels (differentiable approximation of L0, normalized by count)."""
         shift = self.beta * math.log(-self.gamma / self.zeta)
-        return torch.sigmoid(self.log_alpha - shift).sum()
+        return torch.sigmoid(self.log_alpha - shift).mean()
 
 
 class RotaryEmbedding(nn.Module):
@@ -360,9 +509,9 @@ class RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, input: torch.Tensor, offset: int = 0) -> torch.Tensor:  # (..., L, dim)
-        # offset: absolute position of the first element in the sequence
-        positions = torch.arange(offset, offset + input.size(-2), device=input.device, dtype=torch.float32)
+    def forward(self, input: torch.Tensor, offset: int = 0, stride: int = 1) -> torch.Tensor:  # (..., L, dim)
+        # offset: absolute position of the first element; stride: position gap between consecutive elements
+        positions = offset + stride * torch.arange(input.size(-2), device=input.device, dtype=torch.float32)
         angles = torch.outer(positions, self.inv_freq)  # (L, dim / 2)
         cos, sin = angles.cos().repeat(1, 2), angles.sin().repeat(1, 2)  # (L, dim)
         x1, x2 = input.chunk(2, dim=-1)
@@ -436,19 +585,21 @@ class CrossAttention(nn.Module):
         is_causal: bool = False,
         query_offset: int = 0,
         key_padding_mask: torch.Tensor | None = None,
+        key_offset: int = 0,
+        key_stride: int = 1,
     ) -> torch.Tensor:
         # query: (N, L_q, D), memory: (N, L_kv, kv_dim)
-        # Memory positions are 0..L_kv-1; query_offset is the position of the first query (L_kv when forecasting)
+        # RoPE positions: query i at query_offset + i, memory j at key_offset + j * key_stride (same time units)
         # key_padding_mask: (N, L_kv) bool, True = padding to ignore
         n, l_q, d = query.shape
         l_kv = memory.size(1)
         if is_causal:
-            assert l_q == l_kv and query_offset == 0, "causal cross-attention requires time-aligned sequences"
+            assert l_q == l_kv and query_offset == key_offset == 0 and key_stride == 1, "causal cross-attention requires time-aligned sequences"
         q = self.q_proj(query).view(n, l_q, self.num_heads, -1).transpose(1, 2)  # (N, H, L_q, D/H)
         k, v = self.kv_proj(memory).chunk(2, dim=-1)
         k, v = (t.view(n, l_kv, self.num_heads, -1).transpose(1, 2) for t in (k, v))  # (N, H, L_kv, D/H)
         if self.rope is not None:
-            q, k = self.rope(q, query_offset), self.rope(k)
+            q, k = self.rope(q, query_offset), self.rope(k, key_offset, key_stride)
         attn_mask = None
         if key_padding_mask is not None:
             assert not is_causal, "key_padding_mask is not supported together with is_causal"
@@ -511,8 +662,11 @@ class CrossTransformerBlock(nn.Module):
         offset: int = 0,
         text_memory: torch.Tensor | None = None,
         text_padding_mask: torch.Tensor | None = None,
+        memory_offset: int = 0,
+        memory_stride: int = 1,
     ) -> torch.Tensor:
-        # input: (N, L, D), memory: (N, L_kv, kv_dim); offset is the position of the first input element
+        # input: (N, L, D), memory: (N, L_kv, kv_dim); offset is the position of the first input element and
+        # memory token j sits at memory_offset + j * memory_stride
         # text_memory: (N, L_text, text_dim); text_padding_mask: (N, L_text) bool, True = padding
         x = input + self.dropout(self.self_attn(self.self_attn_norm(input), offset))
         x = x + self.dropout(
@@ -521,6 +675,8 @@ class CrossTransformerBlock(nn.Module):
                 self.memory_norm(memory),
                 is_causal,
                 query_offset=offset,
+                key_offset=memory_offset,
+                key_stride=memory_stride,
             )
         )
         if self.text_attn is not None and text_memory is not None:
@@ -560,6 +716,8 @@ class CausalConv1d(nn.Conv1d):
 
     The built-in padding argument pads both sides symmetrically, so padding is fixed to 0 and forward pads
     (kernel_size - 1) * dilation zeros on the left only. Output length equals input length when stride=1.
+    With stride > 1 the windows are aligned so the last output ends exactly at the last input step: output j
+    ends at input step (L - 1) % stride + j * stride, and the output length is ceil(L / stride).
     Only zero padding is safe: 'reflect' and 'circular' would copy future values into the left padding.
     """
 
@@ -587,7 +745,9 @@ class CausalConv1d(nn.Conv1d):
             **kwargs,
         )
         self.left_pad = (kernel_size - 1) * dilation
+        self.conv_stride = stride
 
     def forward(self, input):
-        x = F.pad(input, (self.left_pad, 0))
+        # Shift the stride grid so the last window ends at the last input step (a negative pad crops the left)
+        x = F.pad(input, (self.left_pad - (input.size(-1) - 1) % self.conv_stride, 0))
         return super().forward(x)

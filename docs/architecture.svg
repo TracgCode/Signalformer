@@ -47,15 +47,15 @@
   <text x="72" y="390" class="bold" fill="#3b6fd4">LowRankCausalConv1d (n_rank)</text>
   <rect x="80" y="400" width="300" height="50" rx="6" class="box"/>
   <text x="230" y="420" text-anchor="middle" class="bold">time_conv: CausalConv1d (depthwise)</text>
-  <text x="230" y="438" text-anchor="middle" class="small">groups = B·C, out = B·C·n_rank, left pad (k−1)</text>
+  <text x="230" y="438" text-anchor="middle" class="small">out = B·C·n_rank, stride = conv_stride, left pad</text>
   <line x1="230" y1="450" x2="230" y2="468" class="line" marker-end="url(#arrow)"/>
   <rect x="80" y="470" width="300" height="50" rx="6" class="box"/>
   <text x="230" y="490" text-anchor="middle" class="bold">channel_conv: Conv1d 1×1</text>
-  <text x="230" y="508" text-anchor="middle" class="small">mix channels per time step  →  (N, d_model, L)</text>
+  <text x="230" y="508" text-anchor="middle" class="small">groups = 1 or C (cross_channel) → (N, d_model, T)</text>
   <line x1="230" y1="540" x2="230" y2="563" class="line" marker-end="url(#arrow)"/>
 
   <rect x="70" y="565" width="320" height="36" rx="6" class="box"/>
-  <text x="230" y="588" text-anchor="middle">GELU → transpose → (N, L, d_model)</text>
+  <text x="230" y="588" text-anchor="middle">GELU → transpose → (N, T, d_model)</text>
   <line x1="230" y1="601" x2="230" y2="628" class="line" marker-end="url(#arrow)"/>
 
   <circle cx="230" cy="640" r="11" class="plus"/>
@@ -111,7 +111,7 @@
   <line x1="230" y1="1118" x2="230" y2="1168" class="line" marker-end="url(#arrow)"/>
 
   <rect x="120" y="1170" width="220" height="36" rx="18" class="pill"/>
-  <text x="230" y="1193" text-anchor="middle" class="bold">memory (N, L, d_model)</text>
+  <text x="230" y="1193" text-anchor="middle" class="bold">memory (N, T, d_model)</text>
 
   <!-- memory -> decoder cross-attention -->
   <path d="M340,1188 H565 V532 H638" class="line" marker-end="url(#arrow)"/>
@@ -237,5 +237,5 @@
   <text x="610" y="1289" text-anchor="middle" class="bold" font-size="12">+</text>
   <text x="626" y="1289">addition / residual connection</text>
   <text x="56" y="1316" class="small">Causality: every token at time t depends only on inputs at times ≤ t (left-padded convs, trailing MAs, causal masks).</text>
-  <text x="56" y="1331" class="small">Decoder cross-attention sees all of memory, which is entirely past data. N batch, C signals, L input length, B bands, s = samples_per_output.</text>
+  <text x="56" y="1331" class="small">Decoder cross-attention sees all of memory, which is entirely past data. N batch, C signals, L input length, B bands, T = ceil(L / conv_stride), s = samples_per_output.</text>
 </svg>

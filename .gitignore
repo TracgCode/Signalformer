@@ -22,6 +22,10 @@ env/
 .coverage
 htmlcov/
 
+# Third-party datasets have their own licenses; never commit them (fetch with demo/download_data.py)
+demo/data/
+*.zip
+
 # Data and model artifacts
 data/
 *.csv

@@ -132,14 +132,14 @@
 
   <section>
     <h2>Overview</h2>
-    <p>The model has three submodules, run in order. Shapes use <code>N</code> for batch, <code>C</code> for input signals, <code>L</code> for input length, <code>B</code> for bands per signal and <code>s</code> for <code>samples_per_output</code>.</p>
+    <p>The model has three submodules, run in order. Shapes use <code>N</code> for batch, <code>C</code> for input signals, <code>L</code> for input length, <code>B</code> for bands per signal, <code>T = ceil(L / conv_stride)</code> for tokens and <code>s</code> for <code>samples_per_output</code>.</p>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Module</th><th>Input</th><th>Output</th><th>Role</th></tr></thead>
         <tbody>
-          <tr class="tok"><td><span class="key-dot"></span>SignalTokenizer</td><td class="num">(N, C, L)</td><td class="num">(N, L, d_model)</td><td>One token per time step</td></tr>
-          <tr class="enc"><td><span class="key-dot"></span>SignalEncoder</td><td class="num">(N, L, d_model)</td><td class="num">(N, L, d_model)</td><td>Context over the input window (memory)</td></tr>
-          <tr class="dec"><td><span class="key-dot"></span>SignalDecoder</td><td class="num">(N, L, d_model)</td><td class="num">(N, out_channels, output_length)</td><td>Forecast of all future steps at once</td></tr>
+          <tr class="tok"><td><span class="key-dot"></span>SignalTokenizer</td><td class="num">(N, C, L)</td><td class="num">(N, T, d_model)</td><td>One token per <code>conv_stride</code> input steps</td></tr>
+          <tr class="enc"><td><span class="key-dot"></span>SignalEncoder</td><td class="num">(N, T, d_model)</td><td class="num">(N, T, d_model)</td><td>Context over the input window (memory)</td></tr>
+          <tr class="dec"><td><span class="key-dot"></span>SignalDecoder</td><td class="num">(N, T, d_model)</td><td class="num">(N, out_channels, output_length)</td><td>Forecast of all future steps at once</td></tr>
         </tbody>
       </table>
     </div>
@@ -169,26 +169,44 @@ loss = task_loss(y, target) + lam * model.penalty()</code></pre>
 
     <div class="sub">
       <h3>L0Gate <span class="shape">(N, B·C, L) → (N, B·C, L)</span></h3>
-      <p>A Hard Concrete gate (Louizos et al., 2018) learns one weight per channel that can be exactly zero. During training the gate samples a stretched, clipped sigmoid; at evaluation it is deterministic. <code>penalty()</code> returns the expected number of open channels, a differentiable approximation of the L0 norm.</p>
+      <p>A Hard Concrete gate (Louizos et al., 2018) learns one weight per channel that can be exactly zero. During training the gate samples a stretched, clipped sigmoid; at evaluation it is deterministic. <code>penalty()</code> returns the expected fraction of open channels, a differentiable approximation of the L0 norm divided by the number of channels.</p>
       <ul>
         <li>Standardize inputs first, or gate values reflect feature scale rather than importance.</li>
-        <li>Set <code>lam</code> so the penalty is roughly 1–10% of the task loss to start. Too large closes every gate.</li>
+        <li>Because the penalty is a fraction, <code>lam</code> means the same thing for any number of channels. Around <code>1e-2</code> is a starting point for a z-scored MSE loss; too large closes every gate.</li>
         <li>Give <code>log_alpha</code> its own optimizer group with a higher learning rate and <code>weight_decay=0</code>.</li>
         <li>Correlated channels may be selected arbitrarily. Trust a selection only if it is stable across seeds and validation folds.</li>
       </ul>
     </div>
 
     <div class="sub">
-      <h3>LowRankCausalConv1d <span class="shape">(N, B·C, L) → (N, d_model, L)</span></h3>
+      <h3>LowRankCausalConv1d <span class="shape">(N, B·C, L) → (N, d_model, T)</span></h3>
       <p>A depthwise separable causal convolution, equal to the sum of <code>n_rank</code> rank-1 convolutions:</p>
       <pre><code>W[o, c, j] = Σ_r  B[o, c, r] · a[c, r, j]</code></pre>
       <ul>
         <li><code>time_conv</code> is a depthwise <code>CausalConv1d</code> (<code>groups = B·C</code>). Each channel is filtered along time on its own, with <code>n_rank</code> kernels per channel and <code>(kernel_size − 1)·dilation</code> zeros padded on the left.</li>
-        <li><code>channel_conv</code> is a 1×1 convolution. At each time step it mixes all channels, which is the same as a per-step <code>Linear</code>, so it is causal by construction.</li>
+        <li><code>channel_conv</code> is a 1×1 convolution. At each step it mixes channels, which is the same as a per-step <code>Linear</code>, so it is causal by construction.</li>
         <li>No activation sits between the two convolutions, otherwise the low-rank factorization no longer holds. The rank is capped at <code>min(kernel_size, d_model)</code>, so <code>n_rank ≥ kernel_size</code> is as expressive as a full <code>Conv1d</code>.</li>
         <li>Only zero padding is safe. Reflect or circular padding would copy future values into the left pad.</li>
       </ul>
-      <p>A GELU follows the convolution, then the tensor is transposed to <code>(N, L, d_model)</code> tokens.</p>
+      <p>A GELU follows the convolution, then the tensor is transposed to <code>(N, T, d_model)</code> tokens.</p>
+    </div>
+
+    <div class="sub">
+      <h3>Patching with <code>conv_stride</code> <span class="shape">L → T = ceil(L / conv_stride)</span></h3>
+      <p>With <code>conv_stride = S &gt; 1</code>, <code>time_conv</code> emits one token per <code>S</code> input steps, so each token summarizes a patch. This is the same operation as PatchTST's patch embedding: a patch of length <code>P</code> taken every <code>S</code> steps and projected linearly is a convolution with <code>kernel_size = P</code> and stride <code>S</code>. Set <code>kernel_size = conv_stride</code> for non-overlapping patches and <code>kernel_size &gt; conv_stride</code> for overlapping ones (for example 16 and 8). A shorter token sequence also cuts the O(T²) cost of attention.</p>
+      <ul>
+        <li>The stride grid is aligned so the last token ends at the last input step. Token <code>j</code> ends at input step <code>(L − 1) % S + j·S</code>, so the most recent data is always used even when <code>L</code> is not a multiple of <code>S</code>.</li>
+        <li><code>kernel_size</code> must be at least <code>conv_stride</code>, otherwise input steps between kernels would never be seen. The model rejects such settings.</li>
+        <li>Time features are taken from the last input step each token covers.</li>
+        <li>RoPE positions stay in input-time units on the decoder side: memory token <code>j</code> sits at <code>(L − 1) % S + j·S</code> and forecast step <code>k</code> at <code>L + k</code>, so cross-attention still sees the real time gap. Encoder self-attention uses token indices, which scales every distance by the same factor.</li>
+      </ul>
+      <p class="note"><code>n_rank</code> matters much more once patches are long. <code>time_conv</code> compresses each channel's patch into <code>n_rank</code> numbers before channels are mixed, so <code>kernel_size = 16</code> with <code>n_rank = 1</code> keeps only one weighted average per channel and loses the shape inside the patch. <code>n_rank ≥ kernel_size</code> makes the tokenizer as expressive as a full patch projection; values between a quarter and a half of <code>kernel_size</code> trade capacity for fewer parameters.</p>
+    </div>
+
+    <div class="sub">
+      <h3>Signal independence with <code>cross_channel</code></h3>
+      <p>By default <code>channel_conv</code> mixes the bands of all signals into each token. With <code>cross_channel=False</code> it is grouped by signal: each signal mixes only its own bands and owns <code>d_model / C</code> dimensions of the token, so <code>d_model</code> must be divisible by <code>C</code>. Before the grouped convolution the channels are reordered from band-major to signal-major, so each signal's bands are contiguous.</p>
+      <p>Mixing signals early can overfit to correlations that do not persist, while keeping them apart can miss real interactions. Which works better depends on the data, so compare both settings. Signals stay independent only inside the tokenizer; attention layers still combine them. This is weaker than the full channel independence of PatchTST, which runs every signal through the whole Transformer separately.</p>
     </div>
 
     <div class="sub">
@@ -245,7 +263,7 @@ y = y + Dropout(TextCrossAttention(RMSNorm(y), RMSNorm(text)))   # only if text_
 y = y + Dropout(FFN(RMSNorm(y)))</code></pre>
       <ul>
         <li>Self-attention is causal. Future step <em>k</em> sits at RoPE position <code>L + k</code>, so step <em>k</em> sees only steps ≤ <em>k</em>.</li>
-        <li>Cross-attention to memory is not causal, since memory holds only past data. RoPE gives queries positions <code>L, L+1, …</code> and memory positions <code>0 … L−1</code>, so scores reflect the real time gap.</li>
+        <li>Cross-attention to memory is not causal, since memory holds only past data. RoPE gives queries positions <code>L, L+1, …</code> and memory tokens the input step they end at, so scores reflect the real time gap at any <code>conv_stride</code>.</li>
         <li>Memory has its own RMSNorm inside each block.</li>
       </ul>
     </div>
@@ -276,7 +294,7 @@ y = y + Dropout(FFN(RMSNorm(y)))</code></pre>
         <thead><tr><th>Component</th><th>Mechanism</th></tr></thead>
         <tbody>
           <tr><td>MultiScaleDecomp</td><td>Trailing moving averages, left-padded with the first value</td></tr>
-          <tr><td>time_conv</td><td>Left zero-padding of <code>(kernel_size − 1)·dilation</code></td></tr>
+          <tr><td>time_conv</td><td>Left zero-padding of <code>(kernel_size − 1)·dilation</code>; with a stride, every window ends at or before the token's last input step</td></tr>
           <tr><td>channel_conv</td><td>Kernel size 1 touches only the current step</td></tr>
           <tr><td>RMSNorm, FFN</td><td>Operate per time step over features</td></tr>
           <tr><td>Self-attention</td><td><code>is_causal=True</code> in encoder and decoder</td></tr>
@@ -296,11 +314,11 @@ y = y + Dropout(FFN(RMSNorm(y)))</code></pre>
           <tr><td>in_channels</td><td class="num">—</td><td>Number of input signals <code>C</code></td></tr>
           <tr><td>in_len</td><td class="num">—</td><td>Input length <code>L</code> (currently unused by the modules)</td></tr>
           <tr><td>d_model</td><td class="num">—</td><td>Token width; must be divisible by <code>num_heads</code></td></tr>
-          <tr><td>kernel_size</td><td class="num">—</td><td>Temporal kernel of <code>time_conv</code></td></tr>
+          <tr><td>kernel_size</td><td class="num">—</td><td>Temporal kernel of <code>time_conv</code> (patch length when <code>conv_stride &gt; 1</code>)</td></tr>
           <tr><td>output_length</td><td class="num">—</td><td>Number of output steps</td></tr>
           <tr><td>num_heads</td><td class="num">—</td><td>Attention heads; <code>d_model / num_heads</code> must be even for RoPE</td></tr>
           <tr><td>ma_windows</td><td class="num">(5, 20, 60)</td><td>Strictly increasing MA windows; <code>B = len + 1</code></td></tr>
-          <tr><td>n_rank</td><td class="num">1</td><td>Number of rank-1 terms in the tokenizer convolution</td></tr>
+          <tr><td>n_rank</td><td class="num">1</td><td>Number of rank-1 terms in the tokenizer convolution; raise it with long patches</td></tr>
           <tr><td>num_encoder_layers</td><td class="num">2</td><td>Encoder blocks</td></tr>
           <tr><td>num_decoder_layers</td><td class="num">2</td><td>Decoder blocks</td></tr>
           <tr><td>dropout</td><td class="num">0.1</td><td>Dropout in attention and residual branches</td></tr>
@@ -308,6 +326,8 @@ y = y + Dropout(FFN(RMSNorm(y)))</code></pre>
           <tr><td>out_channels</td><td class="num">1</td><td>Values per output step</td></tr>
           <tr><td>samples_per_output</td><td class="num">1</td><td>Input steps aggregated into one output step (<code>s</code>)</td></tr>
           <tr><td>text_dim</td><td class="num">0</td><td>Width of text embeddings; 0 disables text cross-attention</td></tr>
+          <tr><td>conv_stride</td><td class="num">1</td><td>Input steps per token (patching); must be ≤ <code>kernel_size</code></td></tr>
+          <tr><td>cross_channel</td><td class="num">True</td><td>Mix bands across signals in the tokenizer; <code>False</code> groups by signal and needs <code>d_model % C == 0</code></td></tr>
         </tbody>
       </table>
     </div>

@@ -14,6 +14,8 @@ Signalformer splits each input signal into multi-scale frequency bands, selects 
 - **Multi-scale decomposition**: trailing moving averages split each signal into bands from fine to coarse (`x − MA_w1, MA_w1 − MA_w2, …, MA_wk`). The bands sum back to the input exactly.
 - **Learned feature selection**: a Hard Concrete L0 gate learns a per-band weight that can be exactly zero.
 - **Convolutional tokenizer**: a depthwise separable causal convolution, configurable as a sum of `n_rank` rank-1 convolutions.
+- **Patching**: `conv_stride` turns the tokenizer into a causal patch embedding, one token per `conv_stride` input steps.
+- **Optional signal independence**: `cross_channel=False` keeps signals separate inside the tokenizer.
 - **Causal Transformer**: pre-norm blocks with RMSNorm, rotary position embeddings (RoPE) on queries and keys, and `F.scaled_dot_product_attention`.
 - **Non-autoregressive decoder**: learnable queries predict all future steps in one pass.
 - **Optional inputs**: calendar or other known-in-advance time features for past and future steps, and cross-attention to embeddings from an external text encoder.
@@ -44,6 +46,18 @@ x = torch.randn(32, 5, 128)  # (N, C, L)
 y = model(x)                 # (N, out_channels, output_length) = (32, 1, 4)
 ```
 
+### Patching
+
+```python
+model = Signalformer(
+    in_channels=5, in_len=128, d_model=80, output_length=4, num_heads=4,
+    kernel_size=16,         # patch length
+    conv_stride=8,          # one token every 8 steps (overlapping patches), 16 tokens instead of 128
+    n_rank=8,               # keep enough detail per patch
+    cross_channel=False,    # optional: keep signals separate in the tokenizer (d_model % in_channels == 0)
+)
+```
+
 ### Optional inputs
 
 ```python
@@ -66,7 +80,7 @@ y = model(
 
 ## Training
 
-Add the gate penalty to the task loss. It is the expected number of open gates, so it pushes unused bands toward zero.
+Add the gate penalty to the task loss. It is the expected fraction of open gates (0 to 1), so it pushes unused bands toward zero and `lam` means the same thing for any number of signals.
 
 ```python
 gate_params = [model.tokenizer.gate.log_alpha]
@@ -83,7 +97,7 @@ loss.backward()
 optimizer.step()
 ```
 
-Start with `lam` so the penalty is roughly 1–10% of the task loss.
+`lam` around `1e-2` is a reasonable start for a z-scored MSE loss.
 
 ## Usage notes
 
@@ -92,6 +106,7 @@ Start with `lam` so the penalty is roughly 1–10% of the task loss.
 - **Prefer stationary inputs.** Use differences, log ratios or rates of change instead of drifting levels. RMSNorm does not remove the mean.
 - **Encode time features carefully.** Use sin/cos pairs for cyclical fields and 0/1 flags for known events. Avoid absolute year features, which force the model to extrapolate on later test periods.
 - **Only use information available at forecast time.** Future time features must be known in advance, and text must have been available before the end of the input window.
+- **Raise `n_rank` with long patches.** With `conv_stride > 1`, each channel's patch is compressed to `n_rank` numbers before channels are mixed. `n_rank = 1` with `kernel_size = 16` keeps only one weighted average per patch; `n_rank >= kernel_size` loses nothing.
 - **Check gate stability.** Correlated bands may be selected arbitrarily. Trust a selection only if it is stable across seeds and validation folds.
 
 ## Documentation

@@ -47,19 +47,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--seq-len", type=int, default=96)
     p.add_argument("--pred-len", type=int, default=96, help="usually 96, 192, 336 or 720")
     # Model
-    p.add_argument("--d-model", help="a multiple of num_heads * 8, or 'auto' for 2 x signals clamped to [32, 256]")
+    p.add_argument("--d-model", help="a multiple of num_heads * 8; 'auto' for 2 x signals clamped to [32, 256]; "
+                   "'half' for signals / 2, at least 32")
     p.add_argument("--num-heads", type=int, default=4)
     p.add_argument("--kernel-size", type=int, default=3)
     p.add_argument("--conv-stride", type=int, default=1)
     p.add_argument("--n-rank", type=int, default=1)
     p.add_argument("--no-cross-channel", action="store_true", help="group the tokenizer channel conv by signal")
-    p.add_argument("--ma-windows", default="4,16,48", help="comma-separated, strictly increasing")
+    p.add_argument("--ma-windows", default="4,16,48",
+                   help="comma-separated, strictly increasing; also the kernel sizes of --front-end conv_bank")
+    p.add_argument("--front-end", choices=("ma", "conv_bank"), default="ma",
+                   help="moving-average decomposition or a learnable bank of causal depthwise convolutions")
+    p.add_argument("--bank-filters", type=int, default=8, help="conv_bank filters per kernel size")
     p.add_argument("--encoder-layers", type=int)
     p.add_argument("--decoder-layers", type=int)
     p.add_argument("--dropout", type=float)
     p.add_argument("--no-revin", action="store_true", help="disable reversible instance normalization")
     p.add_argument("--channel-independent", action="store_true",
                    help="run every signal through the model separately with shared weights (PatchTST-style)")
+    p.add_argument("--ci-latents", default="0",
+                   help="with --channel-independent: project the signals to this many latent signals first "
+                   "(an integer, or 'half' for ceil(signals / 2)); 0 = off")
     p.add_argument("--time-features", default="none",
                    help=f"comma-separated subset of {','.join(TIME_FIELDS)}, or 'none'")
     # Optimization
@@ -86,6 +94,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--tag", default="", help="label stored in the result file and its name")
     p.add_argument("--output", type=Path, help="result JSON path (default: demo/runs/<dataset>_<pred_len>_...)")
     args = p.parse_args(argv)
+    if args.ci_latents != "0" and not args.channel_independent:
+        p.error("--ci-latents requires --channel-independent")
     if args.time_features == "none":
         args.time_fields = ()
     else:
@@ -103,23 +113,28 @@ HEAD_DIM_MULTIPLE = 8  # FlashAttention kernels expect head widths that are mult
 
 
 def resolve_d_model(value, num_signals: int, num_heads: int) -> int:
-    """'auto': twice the number of signals, clamped to [32, 256] and rounded up to a multiple of
-    num_heads * 8. Every attention head then has a width that is a multiple of 8, which keeps the attention
+    """'auto': twice the number of signals, clamped to [32, 256]; 'half': half the number of signals, at least
+    32. Both are rounded up to a multiple of num_heads * 8. Every attention head then has a width that is a multiple of 8, which keeps the attention
     on the FlashAttention kernel (and even, as RoPE requires). Explicit values must satisfy the same rule."""
     step = HEAD_DIM_MULTIPLE * num_heads
-    if str(value) != "auto":
+    if str(value) not in ("auto", "half"):
         d_model = int(value)
         if d_model % step != 0:
             raise ValueError(f"d_model={d_model} must be a multiple of num_heads * {HEAD_DIM_MULTIPLE} = {step}")
         return d_model
-    width = min(max(2 * num_signals, 32), 256)
+    width = min(max(2 * num_signals, 32), 256) if value == "auto" else max(-(-num_signals // 2), 32)
     return -(-width // step) * step
+
+
+def resolve_ci_latents(value, num_signals: int) -> int:
+    return -(-num_signals // 2) if str(value) == "half" else int(value)
 
 
 def effective_config(args: argparse.Namespace, num_signals: int) -> dict:
     """Everything that determines the trained model and its scores, with 'auto' values resolved."""
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k not in NON_CONFIG_ARGS}
     config["d_model"] = resolve_d_model(args.d_model, num_signals, args.num_heads)
+    config["ci_latents"] = resolve_ci_latents(args.ci_latents, num_signals)
     config["time_fields"] = list(args.time_fields)
     return config
 
@@ -218,6 +233,7 @@ def main() -> None:
     splits = build_splits(args.dataset, args.seq_len, args.pred_len, args.time_fields)
     num_signals = splits["train"].values.size(0)
     args.d_model = resolve_d_model(args.d_model, num_signals, args.num_heads)
+    args.ci_latents = resolve_ci_latents(args.ci_latents, num_signals)
     use_time = len(args.time_fields) > 0
     train, val, test = (DeviceWindows(splits[s], args.device, use_time) for s in ("train", "val", "test"))
 
@@ -239,6 +255,9 @@ def main() -> None:
         cross_channel=not args.no_cross_channel,
         revin=not args.no_revin,
         channel_independent=args.channel_independent,
+        ci_latents=args.ci_latents,
+        front_end=args.front_end,
+        bank_filters=args.bank_filters,
     ).to(args.device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"{args.dataset}: {num_signals} signals, train/val/test windows = "

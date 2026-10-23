@@ -60,14 +60,26 @@ VARIANTS = {
     "large": ["--d-model", "64", "--encoder-layers", "2", "--decoder-layers", "2", "--dropout", "0.1"],
     # Every signal through the model separately (PatchTST-style channel independence)
     "ci": ["--channel-independent"],
+    # Learnable conv bank instead of the moving-average decomposition
+    "conv_bank": ["--front-end", "conv_bank"],
+    "ci_conv_bank": ["--channel-independent", "--front-end", "conv_bank"],
+    # d_model = signals / 2 (at least 32, so only Traffic differs from base)
+    "half_dmodel": ["--d-model", "half"],
+    # Signals projected to signals / 2 latents, each run channel-independently, mapped back by the output head
+    "ci_proj": ["--channel-independent", "--ci-latents", "half"],
+    # Early stopping on the full validation split instead of a 2048-window subset
+    "full_val": ["--val-windows", "0"],
 }
-DEFAULT_VARIANTS = ["base", "muon", "ci"]
+DEFAULT_VARIANTS = ["base", "muon", "ci", "conv_bank", "ci_conv_bank", "half_dmodel", "ci_proj"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 VARIANT_OVERRIDES = {
     # Traffic's "large" doubles its own preset width instead
     ("Traffic", "large"): ["--d-model", "128", "--encoder-layers", "2", "--decoder-layers", "2", "--dropout", "0.1"],
     # Channel independence turns each Traffic window into 862 sequences: 4 windows per batch = 3448 sequences
     ("Traffic", "ci"): ["--channel-independent", "--batch-size", "4"],
+    ("Traffic", "ci_conv_bank"): ["--channel-independent", "--front-end", "conv_bank", "--batch-size", "4"],
+    # 431 latents per window: 8 windows per batch = 3448 sequences, as for "ci"
+    ("Traffic", "ci_proj"): ["--channel-independent", "--ci-latents", "half", "--batch-size", "8"],
 }
 
 
@@ -111,7 +123,7 @@ class Job:
         return result_path(self.dataset, self.pred_len, self.variant, self.seed)
 
     def command(self, compile_model: bool) -> list[str]:
-        cmd = [sys.executable, str(DEMO_DIR / "train.py"), *self.train_argv, "--tag", self.variant]
+        cmd = [sys.executable, "-u", str(DEMO_DIR / "train.py"), *self.train_argv, "--tag", self.variant]
         if compile_model:
             cmd.append("--compile")
         return [*cmd, "--output", str(self.output)]

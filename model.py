@@ -46,6 +46,15 @@ class Signalformer(nn.Module):
     ignoring cross-signal information and running C times as many sequences. It requires
     out_channels == in_channels. The L0 gate then selects frequency bands shared by all signals.
 
+    ci_latents = K > 0 (with channel_independent=True) first mixes the C signals into K latent signals with a
+    learnable per-step projection (C -> K), runs each latent channel-independently, then concatenates the K
+    latents' decoder outputs at every forecast step and maps them back to C signals with the output head. Signals
+    can then share information through the projection while the Transformer still sees univariate sequences, and
+    K < C runs fewer sequences than plain channel independence. RevIN is applied to the C original signals.
+
+    front_end selects the first stage of the tokenizer: "ma" (fixed moving-average decomposition) or
+    "conv_bank" (a learnable bank of causal depthwise convolutions, see CausalConvBank).
+
     Training: add the gate penalty to the loss, e.g. loss = task_loss + lam * model.penalty().
     """
 
@@ -70,17 +79,35 @@ class Signalformer(nn.Module):
         cross_channel: bool = True,
         revin: bool = False,
         channel_independent: bool = False,
+        ci_latents: int = 0,
+        front_end: str = "ma",
+        bank_filters: int = 8,
     ):
         super().__init__()
         if revin:
             assert out_channels == in_channels, "revin requires out_channels == in_channels"
+        assert ci_latents == 0 or channel_independent, "ci_latents requires channel_independent=True"
+        self.channel_independent = channel_independent
+        # Latent projection (C -> K signals per time step); RevIN then normalizes the C original signals
+        self.latent_proj = nn.Linear(in_channels, ci_latents, bias=False) if ci_latents > 0 else None
+        revin_channels = 1 if channel_independent and ci_latents == 0 else in_channels
+        self.revin = RevIN(revin_channels) if revin else None
         if channel_independent:
             assert out_channels == in_channels, "channel_independent requires out_channels == in_channels"
-            in_channels = out_channels = 1  # every submodule sees one signal at a time
-        self.channel_independent = channel_independent
-        self.revin = RevIN(in_channels) if revin else None
+            # every submodule sees one signal at a time; with latents the output head maps K latents back to C
+            in_channels = 1
+            out_channels = out_channels if ci_latents > 0 else 1
         self.tokenizer = SignalTokenizer(
-            in_channels, d_model, kernel_size, ma_windows, n_rank, time_dim, conv_stride, cross_channel
+            in_channels,
+            d_model,
+            kernel_size,
+            ma_windows,
+            n_rank,
+            time_dim,
+            conv_stride,
+            cross_channel,
+            front_end,
+            bank_filters,
         )
         self.encoder = SignalEncoder(d_model, num_heads, num_encoder_layers, dropout)
         self.decoder = SignalDecoder(
@@ -92,6 +119,7 @@ class Signalformer(nn.Module):
             out_channels,
             samples_per_output,
             text_dim,
+            latent_signals=max(ci_latents, 1),
         )
 
     def forward(
@@ -110,15 +138,20 @@ class Signalformer(nn.Module):
             assert time_features is not None and future_time_features is not None, (
                 "time_features and future_time_features are required when time_dim > 0"
             )
-        batch, num_signals = input.shape[:2]
+        batch = input.size(0)
+        stats = None
+        if self.latent_proj is not None:
+            if self.revin is not None:
+                input, stats = self.revin.normalize(input)  # normalize the original signals before mixing them
+            input = self.latent_proj(input.transpose(1, 2)).transpose(1, 2)  # (N, C, L) -> (N, K, L)
+        num_signals = input.size(1)
         if self.channel_independent:
             # (N, C, L) -> (N * C, 1, L); per-sample inputs are repeated for each of its signals
             input = input.reshape(batch * num_signals, 1, -1)
             repeat = lambda t: None if t is None else t.repeat_interleave(num_signals, dim=0)  # noqa: E731
             time_features, future_time_features = repeat(time_features), repeat(future_time_features)
             text_memory, text_padding_mask = repeat(text_memory), repeat(text_padding_mask)
-        stats = None
-        if self.revin is not None:
+        if self.revin is not None and self.latent_proj is None:
             input, stats = self.revin.normalize(input)
         tokens = self.tokenizer(input, time_features)  # (N, T, d_model)
         memory = self.encoder(tokens)  # (N, T, d_model)
@@ -127,7 +160,7 @@ class Signalformer(nn.Module):
         # first forecast step is input step L.
         input_len = input.size(-1)
         memory_offset, memory_stride = self.tokenizer.token_positions(input_len)
-        output = self.decoder(
+        features = self.decoder.features(
             memory,
             future_time,
             text_memory,
@@ -135,10 +168,15 @@ class Signalformer(nn.Module):
             query_offset=input_len,
             memory_offset=memory_offset,
             memory_stride=memory_stride,
-        )  # (N, out_channels, output_length)
+        )  # (N, output_length * samples_per_output, d_model)
+        if self.latent_proj is not None:
+            # (N * K, L_dec, d) -> (N, L_dec, K * d): the K latents' outputs of each step side by side
+            l_dec, d = features.shape[1:]
+            features = features.view(batch, num_signals, l_dec, d).transpose(1, 2).reshape(batch, l_dec, -1)
+        output = self.decoder.head(features)  # (N, out_channels, output_length)
         if self.revin is not None and stats is not None:
             output = self.revin.denormalize(output, stats)
-        if self.channel_independent:
+        if self.channel_independent and self.latent_proj is None:
             output = output.reshape(batch, num_signals, -1)
         return output
 
@@ -181,6 +219,7 @@ class SignalTokenizer(nn.Module):
 
     input (N, C, L)
     -> MultiScaleDecomp         (N, B*C, L)     B = len(ma_windows) + 1 frequency bands
+       or CausalConvBank                        B = 1 + len(ma_windows) * bank_filters learned filters
     -> L0Gate                   (N, B*C, L)     feature selection
     -> LowRankCausalConv1d+GELU (N, d_model, T)
     -> transpose (+ time features, which bypass the conv)  (N, T, d_model)
@@ -206,8 +245,11 @@ class SignalTokenizer(nn.Module):
         time_dim: int = 0,
         conv_stride: int = 1,
         cross_channel: bool = True,
+        front_end: str = "ma",
+        bank_filters: int = 8,
     ) -> None:
         super().__init__()
+        assert front_end in ("ma", "conv_bank"), "front_end must be 'ma' or 'conv_bank'"
         assert conv_stride >= 1, "conv_stride must be >= 1"
         assert kernel_size >= conv_stride, "kernel_size must be >= conv_stride so every input step is covered"
         if not cross_channel:
@@ -215,7 +257,11 @@ class SignalTokenizer(nn.Module):
         self.in_channels = in_channels
         self.conv_stride = conv_stride
         self.cross_channel = cross_channel
-        self.decomp = MultiScaleDecomp(ma_windows)
+        # ma_windows sets the moving-average windows, or the kernel sizes of the conv bank
+        if front_end == "ma":
+            self.decomp = MultiScaleDecomp(ma_windows)
+        else:
+            self.decomp = CausalConvBank(in_channels, ma_windows, bank_filters)
         decomp_channels = self.decomp.num_bands * in_channels  # each signal is split into num_bands bands
         self.gate = L0Gate(decomp_channels)
         self.conv = LowRankCausalConv1d(
@@ -303,6 +349,7 @@ class SignalDecoder(nn.Module):
         out_channels: int = 1,
         samples_per_output: int = 1,
         text_dim: int = 0,
+        latent_signals: int = 1,
     ) -> None:
         super().__init__()
         # One learnable query per future step (non-autoregressive: all steps are predicted at once).
@@ -315,9 +362,11 @@ class SignalDecoder(nn.Module):
         self.norm = nn.RMSNorm(d_model)
         # Each output step aggregates samples_per_output decoder tokens (e.g. 7 for daily input -> weekly
         # output). The tokens are concatenated (not averaged) so the FFN can still use their order.
+        # latent_signals > 1: the head also receives the concatenated features of that many latent signals
+        # (Signalformer ci_latents), so its input is latent_signals * samples_per_output * d_model wide.
         self.samples_per_output = samples_per_output
         self.output_head = nn.Sequential(
-            nn.Linear(samples_per_output * d_model, 4 * d_model),
+            nn.Linear(latent_signals * samples_per_output * d_model, 4 * d_model),
             nn.GELU(),
             nn.Linear(4 * d_model, out_channels),
         )
@@ -332,6 +381,22 @@ class SignalDecoder(nn.Module):
         memory_offset: int = 0,
         memory_stride: int = 1,
     ) -> torch.Tensor:
+        features = self.features(
+            memory, future_time, text_memory, text_padding_mask, query_offset, memory_offset, memory_stride
+        )
+        return self.head(features)  # (N, out_channels, output_length)
+
+    def features(
+        self,
+        memory: torch.Tensor,
+        future_time: torch.Tensor | None = None,
+        text_memory: torch.Tensor | None = None,
+        text_padding_mask: torch.Tensor | None = None,
+        query_offset: int | None = None,
+        memory_offset: int = 0,
+        memory_stride: int = 1,
+    ) -> torch.Tensor:
+        """Normalized decoder outputs before the head: (N, output_length * samples_per_output, d_model)."""
         # memory: (N, T, d_model) from the encoder
         # Positions for RoPE, in input-time units: memory token j sits at memory_offset + j * memory_stride and
         # decoder query k at query_offset + k. query_offset defaults to T (memory at stride 1).
@@ -364,9 +429,12 @@ class SignalDecoder(nn.Module):
                 text_memory=text_memory,
                 text_padding_mask=text_padding_mask,
             )
-        y = self.norm(y)
-        n, l_dec, d = y.shape
-        y = y.reshape(n, l_dec // self.samples_per_output, self.samples_per_output * d)  # (N, output_length, s * d)
+        return self.norm(y)
+
+    def head(self, features: torch.Tensor) -> torch.Tensor:
+        # features: (N, output_length * s, width) with width = latent_signals * d_model
+        n, l_dec, d = features.shape
+        y = features.reshape(n, l_dec // self.samples_per_output, self.samples_per_output * d)  # (N, output_length, s * d)
         y = self.output_head(y)  # (N, output_length, out_channels)
         return y.transpose(1, 2)  # (N, out_channels, output_length), same layout as the input
 
@@ -449,6 +517,42 @@ class MultiScaleDecomp(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C, L) -> (N, num_bands * C, L)
         smooths = [input] + [self._causal_moving_average(input, w) for w in self.windows]
         bands = [fine - coarse for fine, coarse in zip(smooths[:-1], smooths[1:])] + [smooths[-1]]
+        return torch.cat(bands, dim=1)
+
+
+class CausalConvBank(nn.Module):
+    """Learnable alternative to MultiScaleDecomp: a bank of causal depthwise (per-signal) 1-D convolutions.
+
+    For every kernel size k in kernel_sizes, each signal is convolved with filters_per_kernel learned filters of
+    length k. The raw signal is kept as band 0, and filter 0 of each size starts as a trailing moving average, so
+    at initialization the bank spans the same space as MultiScaleDecomp with the same windows; training is then
+    free to turn the other filters into differences, band-passes or any other causal pattern.
+    - Filters are separate for each signal (groups = in_channels) and never mix signals.
+    - Left zero padding only (see CausalConv1d); the first k - 1 steps see incomplete windows.
+    - Output layout is band-major like MultiScaleDecomp: [band 0 of all C signals, band 1 of all C signals, ...].
+    """
+
+    def __init__(self, in_channels: int, kernel_sizes: tuple[int, ...] | list[int], filters_per_kernel: int = 8) -> None:
+        super().__init__()
+        assert len(kernel_sizes) > 0 and filters_per_kernel >= 1
+        self.filters_per_kernel = filters_per_kernel
+        self.num_bands = 1 + len(kernel_sizes) * filters_per_kernel
+        self.convs = nn.ModuleList(
+            CausalConv1d(in_channels, in_channels * filters_per_kernel, k, groups=in_channels, bias=False)
+            for k in kernel_sizes
+        )
+        with torch.no_grad():
+            for conv, k in zip(self.convs, kernel_sizes):
+                assert isinstance(conv, CausalConv1d)
+                # weight (C * F, 1, k): output channel c * F + f is filter f of signal c
+                conv.weight.view(in_channels, filters_per_kernel, k)[:, 0] = 1.0 / k
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C, L) -> (N, num_bands * C, L)
+        n, c, length = input.shape
+        bands = [input]
+        for conv in self.convs:
+            y = conv(input).view(n, c, self.filters_per_kernel, length)  # signal-major
+            bands.append(y.transpose(1, 2).reshape(n, -1, length))  # -> band-major
         return torch.cat(bands, dim=1)
 
 

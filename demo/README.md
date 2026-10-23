@@ -39,7 +39,7 @@ Weather and Traffic are fetched from the Autoformer benchmark archive mirrored b
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py                                  # 4 datasets x horizon 96 x 3 variants x 3 seeds
+python demo/run_benchmarks.py                                  # 4 datasets x horizon 96 x 7 variants x 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants base no_revin
@@ -52,6 +52,11 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 | `base` | none: small model, RevIN, no calendar features, gate penalty 1e-2, AdamW | yes |
 | `muon` | Muon for the matrices inside attention / FFN blocks, AdamW for the rest | yes |
 | `ci` | channel independence: every signal runs through the model separately (Traffic: batch size 4) | yes |
+| `conv_bank` | learnable bank of causal depthwise convolutions (8 filters per kernel size 4, 16, 48) instead of the moving-average split | yes |
+| `ci_conv_bank` | `ci` + `conv_bank` | yes |
+| `half_dmodel` | `d_model` = signals / 2, at least 32 (only Traffic changes: 448) | yes |
+| `ci_proj` | signals projected to ceil(signals / 2) latents per step, each latent channel-independent, output head maps them back (Traffic: batch size 8) | yes |
+| `full_val` | early stopping on the full validation split | |
 | `auto_dmodel` | `d_model` = 2 × signals, clamped to [32, 256], heads a multiple of 8 wide | |
 | `dropout_high` | dropout 0.3 | |
 | `lr_low` | learning rate 1e-4, up to 20 epochs | |

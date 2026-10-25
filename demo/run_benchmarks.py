@@ -42,44 +42,114 @@ DATASET_ARGS = {
     "Traffic": ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8"],
 }
 
-# Each variant changes one thing relative to "base" (the train.py defaults), except "combined"
+# The train.py defaults are channel independence with the raw-input skip ("ci_raw"). Earlier rounds used other
+# defaults, so every variant spells out its mode and keeps the meaning it had when its results were produced:
+# SHARED = one shared token sequence for all signals, no raw skip (the default of the first rounds).
+SHARED = ["--shared", "--no-raw-skip"]
+# Patching with one token per 8 steps (kernel 16, rank 8), the best tokenizer of round 6
+PATCH8 = ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8"]
 VARIANTS = {
-    "base": [],
-    # Width / regularization / learning-rate sweep
-    "auto_dmodel": ["--d-model", "auto"],
-    "dropout_high": ["--dropout", "0.3"],
-    "lr_low": ["--lr", "1e-4", "--epochs", "20"],
-    "combined": ["--d-model", "auto", "--dropout", "0.3", "--lr", "1e-4", "--epochs", "20"],
-    # Optimizer
-    "muon": ["--optimizer", "muon"],
-    "muon_lr_low": ["--optimizer", "muon", "--lr", "1e-4", "--epochs", "20"],
-    # Earlier ablations
-    "no_revin": ["--no-revin"],
-    "with_time": ["--time-features", "hour,dow"],
-    "no_gate_penalty": ["--gate-lambda", "0"],
-    "large": ["--d-model", "64", "--encoder-layers", "2", "--decoder-layers", "2", "--dropout", "0.1"],
-    # Every signal through the model separately (PatchTST-style channel independence)
-    "ci": ["--channel-independent"],
-    # Learnable conv bank instead of the moving-average decomposition
-    "conv_bank": ["--front-end", "conv_bank"],
-    "ci_conv_bank": ["--channel-independent", "--front-end", "conv_bank"],
-    # d_model = signals / 2 (at least 32, so only Traffic differs from base)
-    "half_dmodel": ["--d-model", "half"],
-    # Signals projected to signals / 2 latents, each run channel-independently, mapped back by the output head
-    "ci_proj": ["--channel-independent", "--ci-latents", "half"],
-    # Early stopping on the full validation split instead of a 2048-window subset
-    "full_val": ["--val-windows", "0"],
+    # Round 1-2: shared token sequence
+    "base": SHARED,
+    "auto_dmodel": [*SHARED, "--d-model", "auto"],
+    "dropout_high": [*SHARED, "--dropout", "0.3"],
+    "lr_low": [*SHARED, "--lr", "1e-4", "--epochs", "20"],
+    "combined": [*SHARED, "--d-model", "auto", "--dropout", "0.3", "--lr", "1e-4", "--epochs", "20"],
+    "muon": [*SHARED, "--optimizer", "muon"],
+    "muon_lr_low": [*SHARED, "--optimizer", "muon", "--lr", "1e-4", "--epochs", "20"],
+    "no_revin": [*SHARED, "--no-revin"],
+    "with_time": [*SHARED, "--time-features", "hour,dow"],
+    "no_gate_penalty": [*SHARED, "--gate-lambda", "0"],
+    "large": [*SHARED, "--d-model", "64", "--encoder-layers", "2", "--decoder-layers", "2", "--dropout", "0.1"],
+    "full_val": [*SHARED, "--val-windows", "0"],
+    # Round 3-4: shared vs channel independence, front end, width, latent projection, raw skip, kernels
+    "ci": ["--no-raw-skip"],
+    "conv_bank": [*SHARED, "--front-end", "conv_bank"],
+    "ci_conv_bank": ["--no-raw-skip", "--front-end", "conv_bank"],
+    "half_dmodel": [*SHARED, "--d-model", "half"],
+    "ci_proj": ["--no-raw-skip", "--ci-latents", "half"],
+    "ci_proj_norm": ["--no-raw-skip", "--ci-latents", "half", "--latent-norm"],
+    "raw": ["--shared"],
+    "ci_raw": [],  # the current train.py defaults
+    "ci_conv_bank_raw": ["--front-end", "conv_bank"],
+    "multi_kernel": [*SHARED, "--kernel-size", "3,7,15"],
+    "ci_conv_bank_mk": ["--no-raw-skip", "--front-end", "conv_bank", "--kernel-size", "3,7,15"],
+    # Round 5 (on the ci_raw defaults). No moving-average decomposition: the raw signal goes straight into the
+    # tokenizer conv, with more filters (n_rank) and longer kernels to make up for the missing bands
+    "no_ma_r4": ["--front-end", "none", "--n-rank", "4"],
+    "no_ma_long": ["--front-end", "none", "--n-rank", "4", "--kernel-size", "48"],
+    "no_ma_mk": ["--front-end", "none", "--n-rank", "4", "--kernel-size", "4,16,48"],
+    # Patching: one token per stride steps
+    "patch8": PATCH8,
+    "patch4": ["--kernel-size", "8", "--conv-stride", "4", "--n-rank", "4"],
+    "patch1": ["--kernel-size", "3", "--conv-stride", "1", "--n-rank", "1"],
+    # Frequency-domain memory, and a longer input window where it can resolve slower cycles
+    "freq": ["--freq-tokens"],
+    "seq336": ["--seq-len", "336"],
+    "freq_seq336": ["--seq-len", "336", "--freq-tokens"],
+    # Tree-merging architecture (tree_model.py) with each pairing method
+    "tree_index": ["--architecture", "tree", "--pairing", "index"],
+    "tree_corr": ["--architecture", "tree", "--pairing", "corr"],
+    "tree_random": ["--architecture", "tree", "--pairing", "random"],
+    "tree_soft": ["--architecture", "tree", "--pairing", "soft"],
+    "tree_sampled": ["--architecture", "tree", "--pairing", "sampled"],
+    # Diagnostic for the ci_proj collapse on Traffic (all gates closed in epoch 1): same run without gate penalty
+    "ci_proj_nogate": ["--no-raw-skip", "--ci-latents", "half", "--gate-lambda", "0"],
+    # Round 7. Raw input as a decoder cross-attention memory instead of (or besides) the raw skip
+    "raw_xattn": ["--no-raw-skip", "--raw-tokens"],
+    "patch8_raw_xattn": [*PATCH8, "--no-raw-skip", "--raw-tokens"],
+    "patch8_raw_both": [*PATCH8, "--raw-tokens"],
+    # Longer patches, patching without the MA decomposition (one band, so rank 16 for the same width), a longer
+    # input window, and more dropout against the early overfitting seen with patch8
+    "patch16": ["--kernel-size", "32", "--conv-stride", "16", "--n-rank", "16"],
+    "patch8_no_ma": [*PATCH8[:-1], "16", "--front-end", "none"],
+    "patch8_seq336": [*PATCH8, "--seq-len", "336"],
+    "patch8_freq_seq336": [*PATCH8, "--seq-len", "336", "--freq-tokens"],
+    "patch8_drop": [*PATCH8, "--dropout", "0.3"],
+    # Cross Transformer: channel-independent tokenizer and encoder, then a decoder in which every signal
+    # cross-attends to every signal's memory in signal order; the raw input through the skip or the decoder
+    "cross": ["--architecture", "cross"],
+    "cross_raw_xattn": ["--architecture", "cross", "--no-raw-skip", "--raw-tokens"],
+    "cross_patch8": ["--architecture", "cross", *PATCH8],
+    "cross_patch8_raw_xattn": ["--architecture", "cross", *PATCH8, "--no-raw-skip", "--raw-tokens"],
+    # Learnable gate per (receiving, sending) signal pair, starting as plain channel independence, with L1 sparsity
+    "cross_patch8_gate": ["--architecture", "cross", *PATCH8, "--edge-gates"],
 }
-DEFAULT_VARIANTS = ["base", "muon", "ci", "conv_bank", "ci_conv_bank", "half_dmodel", "ci_proj"]
+# seq336 (round 6) is the reference for patch8_seq336; on Traffic, which always patches by 8, the two are the same
+# configuration and share results. Frequency tokens stay available (--freq-tokens, the freq* variants) but are left
+# out of the default sweep: they only helped at input 336 on two datasets, within noise.
+DEFAULT_VARIANTS = ["ci_raw", "patch8", "seq336", "raw_xattn", "patch8_raw_xattn", "patch8_raw_both", "patch16",
+                    "patch8_no_ma", "patch8_seq336", "patch8_drop", "cross", "cross_raw_xattn", "cross_patch8",
+                    "cross_patch8_raw_xattn", "cross_patch8_gate"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
+# Variants that only run on some datasets (others show "–" in the summary)
+VARIANT_DATASETS = {
+    # Learnable pairings are validated on the smaller datasets first
+    "tree_soft": ("ETTm1", "ETTm2", "Weather"),
+    "tree_sampled": ("ETTm1", "ETTm2", "Weather"),
+    "ci_proj_nogate": ("Traffic",),
+    # C cross-attentions per decoder layer over C sequences: too costly for Traffic's 862 signals
+    "cross": ("ETTm1", "ETTm2", "Weather"),
+    "cross_raw_xattn": ("ETTm1", "ETTm2", "Weather"),
+    "cross_patch8": ("ETTm1", "ETTm2", "Weather"),
+    "cross_patch8_raw_xattn": ("ETTm1", "ETTm2", "Weather"),
+    "cross_patch8_gate": ("ETTm1", "ETTm2", "Weather"),
+}
 VARIANT_OVERRIDES = {
     # Traffic's "large" doubles its own preset width instead
-    ("Traffic", "large"): ["--d-model", "128", "--encoder-layers", "2", "--decoder-layers", "2", "--dropout", "0.1"],
-    # Channel independence turns each Traffic window into 862 sequences: 4 windows per batch = 3448 sequences
-    ("Traffic", "ci"): ["--channel-independent", "--batch-size", "4"],
-    ("Traffic", "ci_conv_bank"): ["--channel-independent", "--front-end", "conv_bank", "--batch-size", "4"],
-    # 431 latents per window: 8 windows per batch = 3448 sequences, as for "ci"
-    ("Traffic", "ci_proj"): ["--channel-independent", "--ci-latents", "half", "--batch-size", "8"],
+    ("Traffic", "large"): [*SHARED, "--d-model", "128", "--encoder-layers", "2", "--decoder-layers", "2",
+                           "--dropout", "0.1"],
+    # Kernels must cover Traffic's patch stride of 8
+    ("Traffic", "multi_kernel"): [*SHARED, "--kernel-size", "8,16,32"],
+    ("Traffic", "ci_conv_bank_mk"): ["--no-raw-skip", "--front-end", "conv_bank", "--kernel-size", "8,16,32"],
+    ("Traffic", "no_ma_r4"): ["--front-end", "none", "--n-rank", "16"],
+    ("Traffic", "no_ma_long"): ["--front-end", "none", "--n-rank", "32", "--kernel-size", "48"],
+    ("Traffic", "no_ma_mk"): ["--front-end", "none", "--n-rank", "8", "--kernel-size", "8,16,48"],
+    # 431 latents per window: 8 windows per batch = 3448 sequences, as for channel independence with batch 4
+    ("Traffic", "ci_proj"): ["--no-raw-skip", "--ci-latents", "half", "--batch-size", "8"],
+    ("Traffic", "ci_proj_norm"): ["--no-raw-skip", "--ci-latents", "half", "--latent-norm", "--batch-size", "8"],
+    ("Traffic", "ci_proj_nogate"): ["--no-raw-skip", "--ci-latents", "half", "--gate-lambda", "0",
+                                    "--batch-size", "8"],
 }
 
 
@@ -135,6 +205,8 @@ def build_jobs(args: argparse.Namespace) -> list[Job]:
     for pred_len in args.pred_lens:
         for dataset in args.datasets:
             for variant in args.variants:
+                if dataset not in VARIANT_DATASETS.get(variant, (dataset,)):
+                    continue
                 for seed in args.seeds:
                     train_argv = [
                         "--dataset", dataset, "--seq-len", str(args.seq_len), "--pred-len", str(pred_len),

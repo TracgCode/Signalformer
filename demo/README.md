@@ -39,33 +39,61 @@ Weather and Traffic are fetched from the Autoformer benchmark archive mirrored b
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py                                  # 4 datasets x horizon 96 x 7 variants x 3 seeds
+python demo/run_benchmarks.py                                  # round 7: 4 datasets x horizon 96 x 10 variants x 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
-python demo/run_benchmarks.py --datasets ETTm1 Weather --variants base no_revin
+python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
 python demo/run_benchmarks.py --dry-run                        # print the commands only
 python demo/run_benchmarks.py -- --epochs 5                    # arguments after -- go to every run
 ```
 
-| Variant | Change from the defaults | Default sweep |
-|---|---|---|
-| `base` | none: small model, RevIN, no calendar features, gate penalty 1e-2, AdamW | yes |
-| `muon` | Muon for the matrices inside attention / FFN blocks, AdamW for the rest | yes |
-| `ci` | channel independence: every signal runs through the model separately (Traffic: batch size 4) | yes |
-| `conv_bank` | learnable bank of causal depthwise convolutions (8 filters per kernel size 4, 16, 48) instead of the moving-average split | yes |
-| `ci_conv_bank` | `ci` + `conv_bank` | yes |
-| `half_dmodel` | `d_model` = signals / 2, at least 32 (only Traffic changes: 448) | yes |
-| `ci_proj` | signals projected to ceil(signals / 2) latents per step, each latent channel-independent, output head maps them back (Traffic: batch size 8) | yes |
-| `full_val` | early stopping on the full validation split | |
-| `auto_dmodel` | `d_model` = 2 × signals, clamped to [32, 256], heads a multiple of 8 wide | |
-| `dropout_high` | dropout 0.3 | |
-| `lr_low` | learning rate 1e-4, up to 20 epochs | |
-| `combined` | `auto_dmodel` + `dropout_high` + `lr_low` | |
-| `muon_lr_low` | `muon` + `lr_low` | |
-| `no_revin` | RevIN off | |
-| `with_time` | hour and day-of-week features | |
-| `no_gate_penalty` | gate penalty 0 | |
-| `large` | `d_model` 64 (Traffic 128), 2 encoder and 2 decoder layers, dropout 0.1 | |
+The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
+
+Round 7, the default sweep (`ci_raw`, `patch8` and `seq336` are round 6 references and are not retrained):
+
+| Variant | Change from the defaults |
+|---|---|
+| `ci_raw` | none (reference) |
+| `patch8` | one token per 8 steps: kernel 16, stride 8, n_rank 8 (Traffic's defaults already patch by 8) |
+| `seq336` | input length 336 |
+| `raw_xattn` | no raw skip; instead every normalized input step is a memory token the decoder cross-attends to (`--raw-tokens`) |
+| `patch8_raw_xattn`, `patch8_raw_both` | `patch8` with the raw cross-attention instead of, or besides, the raw skip |
+| `patch16` | one token per 16 steps: kernel 32, stride 16, n_rank 16 |
+| `patch8_no_ma` | `patch8` without the moving-average decomposition and L0 gate, n_rank 16 |
+| `patch8_seq336` | `patch8` with input length 336 |
+| `patch8_drop` | `patch8` with dropout 0.3 |
+| `cross`, `cross_raw_xattn`, `cross_patch8`, `cross_patch8_raw_xattn` | Cross Transformer (`--architecture cross`): channel-independent tokenizer and encoder, and a decoder in which every signal cross-attends to every signal's memory in signal order; on the defaults, `raw_xattn`, `patch8` and `patch8_raw_xattn` settings (ETT and Weather only) |
+| `cross_patch8_gate` | `cross_patch8` with a learnable gate per (receiving, sending) signal pair, starting as the identity, with an L1 penalty on the cross-signal edges |
+
+Frequency tokens (`--freq-tokens`) remain available but are left out of the default sweep.
+
+Round 6:
+
+| Variant | Change from the defaults |
+|---|---|
+| `no_ma_r4` | no moving-average decomposition and no L0 gate; n_rank 4 (Traffic 16) |
+| `no_ma_long` | as `no_ma_r4` with kernel 48 (Traffic: n_rank 32) |
+| `no_ma_mk` | as `no_ma_r4` with kernels 4, 16, 48 (Traffic: 8, 16, 48, n_rank 8) |
+| `patch8`, `patch4`, `patch1` | one token per 8 / 4 / 1 steps (kernel 16 / 8 / 3, n_rank 8 / 4 / 1); shared results where equal to the defaults |
+| `freq` | rFFT bins of the input window as an extra memory for the decoder |
+| `seq336`, `freq_seq336` | input length 336, without and with `freq` |
+| `tree_index`, `tree_corr`, `tree_random` | tree-merging architecture (`tree_model.py`) with a fixed pairing: adjacent indices, greedy by correlation of first differences on the training split, random |
+| `tree_soft`, `tree_sampled` | tree with learnable pairing: soft mixtures with a negative-variance penalty, or sampled matchings trained with REINFORCE (ETT and Weather only) |
+
+Earlier variants:
+
+| Variant | Configuration |
+|---|---|
+| `base` | `SHARED` |
+| `muon` | `SHARED`, Muon for the matrices inside attention / FFN blocks, AdamW for the rest |
+| `auto_dmodel`, `half_dmodel` | `SHARED`, `d_model` = 2 × signals clamped to [32, 256], or signals / 2 (at least 32) |
+| `dropout_high`, `lr_low`, `combined`, `muon_lr_low` | `SHARED`, dropout 0.3, learning rate 1e-4 for up to 20 epochs, and combinations |
+| `no_revin`, `with_time`, `no_gate_penalty`, `large`, `full_val` | `SHARED`, RevIN off, hour + day-of-week features, gate penalty 0, a larger model, early stopping on the full validation split |
+| `conv_bank`, `multi_kernel` | `SHARED`, learnable causal conv bank instead of the MA split, tokenizer kernels 3, 7, 15 |
+| `raw` | `--shared` with the raw-input skip |
+| `ci`, `ci_conv_bank`, `ci_conv_bank_mk` | channel independence without the raw skip, plus conv bank and multi-kernel |
+| `ci_conv_bank_raw` | the defaults with the conv bank |
+| `ci_proj`, `ci_proj_norm`, `ci_proj_nogate` | channel independence over signals / 2 learned latents (no raw skip), plus per-latent normalization or no gate penalty (Traffic: batch size 8) |
 
 ## Training a single run
 

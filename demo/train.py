@@ -18,11 +18,13 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model import Signalformer  # noqa: E402
+from tree_model import PAIRINGS, TreeSignalformer, correlation_embedding, correlation_tree, random_tree  # noqa: E402
 
 from datasets import TIME_FIELDS, ForecastWindows, build_splits  # noqa: E402
 
@@ -36,6 +38,8 @@ PRESETS = {
     "Weather": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=64, lr=1e-3),
     "Traffic": dict(d_model=64, encoder_layers=2, decoder_layers=1, dropout=0.1, batch_size=16, lr=5e-4),
 }
+# Channel independence (the default) runs every signal as its own sequence: Traffic needs smaller batches
+CI_PRESETS = {"Traffic": dict(batch_size=4)}
 
 # Arguments that do not change what is trained (used to detect duplicate configurations)
 NON_CONFIG_ARGS = {"tag", "output", "device", "compile"}
@@ -50,24 +54,56 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--d-model", help="a multiple of num_heads * 8; 'auto' for 2 x signals clamped to [32, 256]; "
                    "'half' for signals / 2, at least 32")
     p.add_argument("--num-heads", type=int, default=4)
-    p.add_argument("--kernel-size", type=int, default=3)
+    p.add_argument("--kernel-size", default="3",
+                   help="tokenizer conv kernel size, or comma-separated sizes for parallel multi-kernel convs")
     p.add_argument("--conv-stride", type=int, default=1)
     p.add_argument("--n-rank", type=int, default=1)
     p.add_argument("--no-cross-channel", action="store_true", help="group the tokenizer channel conv by signal")
     p.add_argument("--ma-windows", default="4,16,48",
                    help="comma-separated, strictly increasing; also the kernel sizes of --front-end conv_bank")
-    p.add_argument("--front-end", choices=("ma", "conv_bank"), default="ma",
-                   help="moving-average decomposition or a learnable bank of causal depthwise convolutions")
+    p.add_argument("--front-end", choices=("ma", "conv_bank", "none"), default="ma",
+                   help="moving-average decomposition, a learnable bank of causal depthwise convolutions, or none "
+                   "(raw signal straight into the tokenizer conv, no L0 gate)")
     p.add_argument("--bank-filters", type=int, default=8, help="conv_bank filters per kernel size")
+    p.add_argument("--raw-skip", action=argparse.BooleanOptionalAction, default=True,
+                   help="also project the normalized raw input of each token's patch straight into the token")
+    p.add_argument("--freq-tokens", action="store_true",
+                   help="add rFFT bins of the input window as a memory the decoder cross-attends to")
+    p.add_argument("--raw-tokens", action="store_true",
+                   help="add every normalized input step as a memory the decoder cross-attends to (with RoPE)")
     p.add_argument("--encoder-layers", type=int)
     p.add_argument("--decoder-layers", type=int)
     p.add_argument("--dropout", type=float)
     p.add_argument("--no-revin", action="store_true", help="disable reversible instance normalization")
+    p.add_argument("--shared", action="store_true",
+                   help="feed all signals into one shared token sequence instead of the default channel "
+                   "independence (every signal through the model separately with shared weights)")
     p.add_argument("--channel-independent", action="store_true",
-                   help="run every signal through the model separately with shared weights (PatchTST-style)")
+                   help="the default; accepted so older commands keep working")
     p.add_argument("--ci-latents", default="0",
                    help="with --channel-independent: project the signals to this many latent signals first "
                    "(an integer, or 'half' for ceil(signals / 2)); 0 = off")
+    p.add_argument("--latent-norm", action="store_true",
+                   help="with --ci-latents: normalize each latent over its window before the model")
+    # tree: tree-merging architecture (tree_model.py); cross: Cross Transformer, channel-independent encoders and
+    # a decoder in which every signal cross-attends to every signal's memory in signal order
+    p.add_argument("--architecture", choices=("signalformer", "tree", "cross"), default="signalformer")
+    p.add_argument("--edge-gates", action="store_true",
+                   help="cross architecture: learnable gate per (receiving, sending) signal pair, starting as the "
+                   "identity (plain channel independence)")
+    p.add_argument("--edge-lambda", type=float, default=1e-3,
+                   help="weight of the L1 penalty on the cross-signal edge gates")
+    p.add_argument("--tree-widths", default="",
+                   help="comma-separated width per merge level (multiples of num_heads * 8); the last one repeats; "
+                   "empty = d_model at every level")
+    p.add_argument("--pairing", choices=PAIRINGS, default="corr", help="how the tree pairs sequences")
+    p.add_argument("--pair-lambda", type=float, default=1e-2,
+                   help="soft pairing: weight of the concentration / usage penalty, ramped up from 0")
+    p.add_argument("--pair-warmup", type=float, default=0.3,
+                   help="soft pairing: fraction of training steps over which --pair-lambda ramps up")
+    p.add_argument("--pair-lr", type=float, default=1e-2, help="learning rate of the pairing parameters")
+    p.add_argument("--pair-temp", default="1.0,0.1",
+                   help="sampled pairing: start,end sampling temperature, annealed linearly")
     p.add_argument("--time-features", default="none",
                    help=f"comma-separated subset of {','.join(TIME_FIELDS)}, or 'none'")
     # Optimization
@@ -94,8 +130,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--tag", default="", help="label stored in the result file and its name")
     p.add_argument("--output", type=Path, help="result JSON path (default: demo/runs/<dataset>_<pred_len>_...)")
     args = p.parse_args(argv)
-    if args.ci_latents != "0" and not args.channel_independent:
-        p.error("--ci-latents requires --channel-independent")
+    args.channel_independent = not args.shared
+    if args.ci_latents != "0" and args.shared:
+        p.error("--ci-latents requires channel independence (drop --shared)")
+    if args.architecture == "tree" and (args.shared or args.ci_latents != "0" or args.freq_tokens or args.raw_tokens):
+        p.error("the tree architecture is channel-independent and supports none of --ci-latents, --freq-tokens "
+                "and --raw-tokens")
+    if args.architecture == "cross" and (args.shared or args.ci_latents != "0" or args.freq_tokens):
+        p.error("the cross architecture is channel-independent and supports neither --ci-latents nor --freq-tokens")
+    if args.edge_gates and args.architecture != "cross":
+        p.error("--edge-gates requires --architecture cross")
     if args.time_features == "none":
         args.time_fields = ()
     else:
@@ -103,7 +147,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         unknown = set(args.time_fields) - set(TIME_FIELDS)
         if unknown:
             p.error(f"unknown time features: {', '.join(sorted(unknown))}")
-    for key, value in PRESETS[args.dataset].items():
+    presets = dict(PRESETS[args.dataset])
+    if args.channel_independent:
+        presets.update(CI_PRESETS.get(args.dataset, {}))
+    for key, value in presets.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
     return args
@@ -128,6 +175,11 @@ def resolve_d_model(value, num_signals: int, num_heads: int) -> int:
 
 def resolve_ci_latents(value, num_signals: int) -> int:
     return -(-num_signals // 2) if str(value) == "half" else int(value)
+
+
+def parse_kernel_size(value: str) -> int | tuple[int, ...]:
+    sizes = tuple(int(k) for k in str(value).split(","))
+    return sizes[0] if len(sizes) == 1 else sizes
 
 
 def effective_config(args: argparse.Namespace, num_signals: int) -> dict:
@@ -177,7 +229,7 @@ class DeviceWindows:
         return self.num_windows // batch_size if drop_last else -(-self.num_windows // batch_size)
 
 
-def build_optimizers(model: Signalformer, args: argparse.Namespace) -> list[torch.optim.Optimizer]:
+def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Namespace) -> list[torch.optim.Optimizer]:
     """AdamW for everything, or Muon for hidden matrices plus AdamW for the rest.
 
     Muon orthogonalizes the update of each 2-D weight, which only suits hidden matrices: the Linear weights
@@ -186,17 +238,28 @@ def build_optimizers(model: Signalformer, args: argparse.Namespace) -> list[torc
     Muon's input, output and scalar parameters. adjust_lr_fn="match_rms_adamw" scales Muon's step to the
     RMS of an AdamW step, so both optimizers share the same --lr.
     """
-    gate = model.tokenizer.gate.log_alpha
+    gate = [model.tokenizer.gate.log_alpha] if model.tokenizer.gate is not None else []
+    pairing = [p for name, p in model.named_parameters()
+               if name.startswith(("query_logits", "memory_logits", "pair_embedding"))]
+    # Edge gates start as the identity; weight decay would pull the self edges toward 0
+    edges = [p for name, p in model.named_parameters() if name.endswith("edge_gate")]
     muon_params = []
     if args.optimizer == "muon":
-        blocks = [*model.encoder.blocks, *model.decoder.blocks]
+        if isinstance(model, TreeSignalformer):
+            blocks = list(model.merges)
+        else:
+            blocks = [*model.encoder.blocks, *model.decoder.blocks]
         muon_params = [m.weight for b in blocks for m in b.modules() if isinstance(m, torch.nn.Linear)]
-    muon_ids = {id(p) for p in muon_params}
-    adamw_params = [p for p in model.parameters() if p is not gate and id(p) not in muon_ids]
-    optimizers: list[torch.optim.Optimizer] = [torch.optim.AdamW([
-        {"params": adamw_params, "lr": args.lr, "weight_decay": args.weight_decay},
-        {"params": [gate], "lr": args.gate_lr, "weight_decay": 0.0},
-    ])]
+    special = {id(p) for p in [*muon_params, *gate, *pairing, *edges]}
+    adamw_params = [p for p in model.parameters() if id(p) not in special]
+    groups = [{"params": adamw_params, "lr": args.lr, "weight_decay": args.weight_decay}]
+    if gate:
+        groups.append({"params": gate, "lr": args.gate_lr, "weight_decay": 0.0})
+    if pairing:
+        groups.append({"params": pairing, "lr": args.pair_lr, "weight_decay": 0.0})
+    if edges:
+        groups.append({"params": edges, "lr": args.lr, "weight_decay": 0.0})
+    optimizers: list[torch.optim.Optimizer] = [torch.optim.AdamW(groups)]
     if muon_params:
         optimizers.append(torch.optim.Muon(
             muon_params, lr=args.lr, weight_decay=args.weight_decay, momentum=args.muon_momentum,
@@ -224,6 +287,53 @@ def evaluate(forward, model, data: DeviceWindows, batch_size: int, autocast, sub
     return se.item() / count, ae.item() / count  # one host sync per evaluation
 
 
+def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.Tensor):
+    """Signalformer, or TreeSignalformer with its pairing tree computed from the training split only."""
+    common: dict[str, Any] = dict(
+        in_channels=num_signals,
+        in_len=args.seq_len,
+        d_model=args.d_model,
+        kernel_size=parse_kernel_size(args.kernel_size),
+        output_length=args.pred_len,
+        num_heads=args.num_heads,
+        ma_windows=tuple(int(w) for w in args.ma_windows.split(",")),
+        n_rank=args.n_rank,
+        dropout=args.dropout,
+        conv_stride=args.conv_stride,
+        revin=not args.no_revin,
+        front_end=args.front_end,
+        bank_filters=args.bank_filters,
+        raw_skip=args.raw_skip,
+    )
+    if args.architecture == "tree":
+        tree = pair_embedding = None
+        if args.pairing in ("corr", "soft"):
+            tree = correlation_tree(train_values)
+        elif args.pairing == "random":
+            tree = random_tree(num_signals, seed=args.seed)
+        elif args.pairing == "sampled":
+            pair_embedding = correlation_embedding(train_values)
+        widths = tuple(resolve_d_model(w, num_signals, args.num_heads) for w in args.tree_widths.split(",") if w)
+        return TreeSignalformer(
+            **common, tree_widths=widths, pairing=args.pairing, tree=tree, pair_embedding=pair_embedding
+        )
+    return Signalformer(
+        **common,
+        num_encoder_layers=args.encoder_layers,
+        num_decoder_layers=args.decoder_layers,
+        time_dim=2 * len(args.time_fields),
+        out_channels=num_signals,
+        cross_channel=not args.no_cross_channel,
+        channel_independent=args.channel_independent,
+        ci_latents=args.ci_latents,
+        latent_norm=args.latent_norm,
+        freq_tokens=args.freq_tokens,
+        raw_tokens=args.raw_tokens,
+        cross_decoder=args.architecture == "cross",
+        edge_gates=args.edge_gates,
+    )
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -237,31 +347,12 @@ def main() -> None:
     use_time = len(args.time_fields) > 0
     train, val, test = (DeviceWindows(splits[s], args.device, use_time) for s in ("train", "val", "test"))
 
-    model = Signalformer(
-        in_channels=num_signals,
-        in_len=args.seq_len,
-        d_model=args.d_model,
-        kernel_size=args.kernel_size,
-        output_length=args.pred_len,
-        num_heads=args.num_heads,
-        ma_windows=tuple(int(w) for w in args.ma_windows.split(",")),
-        n_rank=args.n_rank,
-        num_encoder_layers=args.encoder_layers,
-        num_decoder_layers=args.decoder_layers,
-        dropout=args.dropout,
-        time_dim=2 * len(args.time_fields),
-        out_channels=num_signals,
-        conv_stride=args.conv_stride,
-        cross_channel=not args.no_cross_channel,
-        revin=not args.no_revin,
-        channel_independent=args.channel_independent,
-        ci_latents=args.ci_latents,
-        front_end=args.front_end,
-        bank_filters=args.bank_filters,
-    ).to(args.device)
+    model = build_model(args, num_signals, splits["train"].values).to(args.device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"{args.dataset}: {num_signals} signals, train/val/test windows = "
           f"{train.num_windows}/{val.num_windows}/{test.num_windows}, params = {num_params:,}")
+    tree_model = model if isinstance(model, TreeSignalformer) else None
+    gate = model.tokenizer.gate
 
     # The compiled module shares parameters with `model`; state_dict, penalty and the gate use `model`
     forward = model
@@ -276,6 +367,7 @@ def main() -> None:
     if args.max_steps is not None:
         steps_per_epoch = min(steps_per_epoch, args.max_steps)
     total_steps = max(1, args.epochs * steps_per_epoch)
+    temp_start, temp_end = (float(t) for t in args.pair_temp.split(","))
     schedulers = []
     for optimizer in optimizers:
         if args.scheduler == "onecycle":
@@ -303,10 +395,26 @@ def main() -> None:
                 break
             for optimizer in optimizers:
                 optimizer.zero_grad(set_to_none=True)
+            global_step = (epoch - 1) * steps_per_epoch + step
+            if tree_model is not None and tree_model.pairing == "sampled":
+                progress = global_step / max(1, total_steps - 1)
+                tree_model.pair_temperature = temp_start + (temp_end - temp_start) * progress
             with autocast():
                 pred = forward(x, t_in, t_out)
-                task_loss = torch.nn.functional.mse_loss(pred.float(), y)
+                sample_loss = (pred.float() - y).pow(2).mean(dim=(1, 2))  # (B,)
+                task_loss = sample_loss.mean()
                 loss = task_loss + args.gate_lambda * model.penalty()
+                if args.edge_gates:
+                    loss = loss + args.edge_lambda * model.edge_penalty()
+            if tree_model is not None and tree_model.pairing == "soft":
+                ramp = min(1.0, global_step / max(1.0, args.pair_warmup * total_steps))
+                loss = loss + args.pair_lambda * ramp * tree_model.pairing_penalty()
+            if tree_model is not None and tree_model.last_log_prob is not None:
+                # REINFORCE for the sampled matchings: every window drew its own matching, and the mean loss of
+                # the other windows in the batch is its baseline (leave-one-out)
+                b = sample_loss.detach()
+                baseline = (b.sum() - b) / max(1, b.numel() - 1)
+                loss = loss + ((b - baseline) * tree_model.last_log_prob).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             for optimizer, scheduler in zip(optimizers, schedulers):
@@ -315,10 +423,10 @@ def main() -> None:
             total += task_loss.detach()  # summed on the device to avoid a host sync every step
         train_mse = total.item() / steps_per_epoch
         val_mse, val_mae = evaluate(forward, model, val, args.batch_size, autocast, args.val_windows, args.max_steps)
-        open_gates = int((model.tokenizer.gate.gate_values() > 0).sum())
         history.append(dict(epoch=epoch, train_mse=train_mse, val_mse=val_mse, val_mae=val_mae))
+        gates = f"open gates {int((gate.gate_values() > 0).sum())}/{gate.log_alpha.numel()}  " if gate else ""
         print(f"epoch {epoch:3d}  train {train_mse:.4f}  val mse {val_mse:.4f} mae {val_mae:.4f}  "
-              f"open gates {open_gates}/{model.tokenizer.gate.log_alpha.numel()}  {time.time() - start:.0f}s")
+              f"{gates}{time.time() - start:.0f}s")
         if val_mse < best_val:
             best_val, bad_epochs = val_mse, 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -343,7 +451,10 @@ def main() -> None:
     out.write_text(json.dumps(dict(
         args={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         num_params=num_params, val_mse=full_val_mse, val_mae=full_val_mae, test_mse=test_mse, test_mae=test_mae,
-        history=history, gate_values=model.tokenizer.gate.gate_values().tolist(),
+        history=history, gate_values=gate.gate_values().tolist() if gate else [],
+        tree=tree_model.tree if tree_model is not None else None,
+        edge_gates=[b.edge_gate.tolist() for b in model.decoder.blocks if getattr(b, "edge_gate", None) is not None]
+        if args.edge_gates else None,
     ), indent=2))
     print(f"saved {out}")
 

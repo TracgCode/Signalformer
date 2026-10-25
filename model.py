@@ -51,9 +51,37 @@ class Signalformer(nn.Module):
     latents' decoder outputs at every forecast step and maps them back to C signals with the output head. Signals
     can then share information through the projection while the Transformer still sees univariate sequences, and
     K < C runs fewer sequences than plain channel independence. RevIN is applied to the C original signals.
+    latent_norm=True additionally normalizes each latent over its window (mean 0, std 1, no affine), so the
+    latents reach the model at a fixed scale whatever the projection weights are. The forecast is still mapped
+    back with the original signals' RevIN statistics.
 
-    front_end selects the first stage of the tokenizer: "ma" (fixed moving-average decomposition) or
-    "conv_bank" (a learnable bank of causal depthwise convolutions, see CausalConvBank).
+    front_end selects the first stage of the tokenizer: "ma" (fixed moving-average decomposition), "conv_bank"
+    (a learnable bank of causal depthwise convolutions, see CausalConvBank) or "none" (the signal goes straight
+    into the tokenizer conv, without decomposition or L0 gate; raise n_rank and kernel_size to compensate).
+
+    freq_tokens=True adds a frequency-domain memory: the rFFT of each (normalized) input window becomes one
+    token per frequency bin, and every decoder block cross-attends to it (see FrequencyEmbedding).
+
+    raw_tokens=True adds a raw-signal memory: every (normalized) input step becomes one token (its C values
+    projected to d_model), and every decoder block cross-attends to it with RoPE at the step's input position.
+    Unlike raw_skip, which adds each patch's raw values to the encoder tokens, this keeps the input at full
+    time resolution for the decoder however coarse the patching is.
+
+    cross_decoder=True (the "Cross Transformer", with channel_independent=True) lets the signals exchange
+    information in the decoder only, as a complete graph: each signal is tokenized and encoded on its own as
+    usual, then the decoder of every signal cross-attends to the encoder memory of every signal, itself
+    included, one after another in signal order (see SignalCrossBlock). With raw_tokens the raw-input
+    cross-attention comes first. A learnable signal embedding is added to each memory (which signal it comes
+    from) and to each signal's decoder queries (which signal is being forecast). Each layer runs C
+    cross-attentions over C sequences, so the cost grows with C^2.
+    edge_gates=True adds a learnable C x C gate per decoder layer on the edges of that graph (see
+    SignalCrossBlock); add lam * model.edge_penalty() to the loss to keep the cross-signal edges sparse.
+
+    output_signals sets the number of forecast signals after the output projection, which maps the C
+    per-signal forecasts of every step to output_signals values (with channel_independent=True). 0 or C keeps
+    an identity mapping (no parameters, the forecast targets are the input signals); any other value uses a
+    per-step FFN across signals (C -> 4 * max(C, output_signals) -> output_signals). It runs after RevIN has
+    restored the input scale, since new output signals have no RevIN statistics of their own.
 
     Training: add the gate penalty to the loss, e.g. loss = task_loss + lam * model.penalty().
     """
@@ -63,7 +91,7 @@ class Signalformer(nn.Module):
         in_channels: int,
         in_len: int,
         d_model: int,
-        kernel_size: int,
+        kernel_size: int | tuple[int, ...],
         output_length: int,
         num_heads: int,
         ma_windows: tuple[int, ...] = (5, 20, 60),
@@ -82,16 +110,38 @@ class Signalformer(nn.Module):
         ci_latents: int = 0,
         front_end: str = "ma",
         bank_filters: int = 8,
+        raw_skip: bool = False,
+        latent_norm: bool = False,
+        freq_tokens: bool = False,
+        raw_tokens: bool = False,
+        cross_decoder: bool = False,
+        edge_gates: bool = False,
+        output_signals: int = 0,
     ):
         super().__init__()
         if revin:
             assert out_channels == in_channels, "revin requires out_channels == in_channels"
         assert ci_latents == 0 or channel_independent, "ci_latents requires channel_independent=True"
+        assert not latent_norm or ci_latents > 0, "latent_norm requires ci_latents > 0"
+        assert not cross_decoder or (channel_independent and ci_latents == 0 and not freq_tokens and text_dim == 0), (
+            "cross_decoder requires channel_independent=True without ci_latents, freq_tokens or text"
+        )
+        assert not edge_gates or cross_decoder, "edge_gates requires cross_decoder=True"
+        assert output_signals in (0, in_channels) or channel_independent, "output_signals requires channel_independent"
+        if output_signals in (0, in_channels):
+            self.output_proj: nn.Module = nn.Identity()
+        else:
+            hidden = 4 * max(in_channels, output_signals)
+            self.output_proj = nn.Sequential(
+                nn.Linear(in_channels, hidden), nn.GELU(), nn.Linear(hidden, output_signals)
+            )
+        self.latent_norm = RevIN(ci_latents, affine=False) if latent_norm else None
         self.channel_independent = channel_independent
         # Latent projection (C -> K signals per time step); RevIN then normalizes the C original signals
         self.latent_proj = nn.Linear(in_channels, ci_latents, bias=False) if ci_latents > 0 else None
         revin_channels = 1 if channel_independent and ci_latents == 0 else in_channels
         self.revin = RevIN(revin_channels) if revin else None
+        num_signals = in_channels
         if channel_independent:
             assert out_channels == in_channels, "channel_independent requires out_channels == in_channels"
             # every submodule sees one signal at a time; with latents the output head maps K latents back to C
@@ -108,6 +158,7 @@ class Signalformer(nn.Module):
             cross_channel,
             front_end,
             bank_filters,
+            raw_skip,
         )
         self.encoder = SignalEncoder(d_model, num_heads, num_encoder_layers, dropout)
         self.decoder = SignalDecoder(
@@ -120,7 +171,14 @@ class Signalformer(nn.Module):
             samples_per_output,
             text_dim,
             latent_signals=max(ci_latents, 1),
+            freq_tokens=freq_tokens,
+            raw_tokens=raw_tokens,
+            cross_signals=num_signals if cross_decoder else 0,
+            edge_gates=edge_gates,
         )
+        # The frequency and raw tokens describe the signals the tokenizer sees (one signal with channel independence)
+        self.freq_embed = FrequencyEmbedding(in_channels, in_len, d_model) if freq_tokens else None
+        self.raw_embed = nn.Linear(in_channels, d_model) if raw_tokens else None
 
     def forward(
         self,
@@ -144,6 +202,8 @@ class Signalformer(nn.Module):
             if self.revin is not None:
                 input, stats = self.revin.normalize(input)  # normalize the original signals before mixing them
             input = self.latent_proj(input.transpose(1, 2)).transpose(1, 2)  # (N, C, L) -> (N, K, L)
+            if self.latent_norm is not None:
+                input, _ = self.latent_norm.normalize(input)  # input side only; outputs are C signals, not latents
         num_signals = input.size(1)
         if self.channel_independent:
             # (N, C, L) -> (N * C, 1, L); per-sample inputs are repeated for each of its signals
@@ -153,6 +213,8 @@ class Signalformer(nn.Module):
             text_memory, text_padding_mask = repeat(text_memory), repeat(text_padding_mask)
         if self.revin is not None and self.latent_proj is None:
             input, stats = self.revin.normalize(input)
+        freq_memory = self.freq_embed(input) if self.freq_embed is not None else None  # (N, L // 2 + 1, d_model)
+        raw_memory = self.raw_embed(input.transpose(1, 2)) if self.raw_embed is not None else None  # (N, L, d_model)
         tokens = self.tokenizer(input, time_features)  # (N, T, d_model)
         memory = self.encoder(tokens)  # (N, T, d_model)
         future_time = self.tokenizer.embed_time(future_time_features) if future_time_features is not None else None
@@ -168,6 +230,8 @@ class Signalformer(nn.Module):
             query_offset=input_len,
             memory_offset=memory_offset,
             memory_stride=memory_stride,
+            freq_memory=freq_memory,
+            raw_memory=raw_memory,
         )  # (N, output_length * samples_per_output, d_model)
         if self.latent_proj is not None:
             # (N * K, L_dec, d) -> (N, L_dec, K * d): the K latents' outputs of each step side by side
@@ -178,10 +242,19 @@ class Signalformer(nn.Module):
             output = self.revin.denormalize(output, stats)
         if self.channel_independent and self.latent_proj is None:
             output = output.reshape(batch, num_signals, -1)
-        return output
+        # (N, C, H) -> (N, output_signals, H), mixing the signals of each step
+        return self.output_proj(output.transpose(1, 2)).transpose(1, 2)
 
     def penalty(self) -> torch.Tensor:
         return self.tokenizer.penalty()
+
+    def edge_penalty(self) -> torch.Tensor:
+        """Mean absolute value of the cross-signal edge gates (L1); zero without edge gates."""
+        gates = [b.edge_gate for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None]
+        if not gates:
+            return self.decoder.queries.new_zeros(())
+        eye = torch.eye(gates[0].size(0), dtype=torch.bool, device=gates[0].device)
+        return torch.stack([g.masked_select(~eye).abs().mean() for g in gates]).mean()
 
 
 class RevIN(nn.Module):
@@ -223,12 +296,15 @@ class SignalTokenizer(nn.Module):
     -> L0Gate                   (N, B*C, L)     feature selection
     -> LowRankCausalConv1d+GELU (N, d_model, T)
     -> transpose (+ time features, which bypass the conv)  (N, T, d_model)
+    [+ raw_skip: Linear over the raw input steps each token covers, bypassing decomposition, gate and conv]
 
     conv_stride = s: one token per s input steps (patching), T = ceil(L / s). Token j covers the input steps
     ending at token_positions(L)[0] + j * s, so the last token always ends at the last input step. kernel_size
     must be >= conv_stride, otherwise some input steps would fall between kernels and never be seen. With long
     patches raise n_rank: each channel's patch is compressed to n_rank numbers before channels are mixed, so
     n_rank = 1 keeps only one weighted average per patch, while n_rank >= kernel_size loses nothing.
+    kernel_size may be a tuple of sizes (multi-kernel, as in Inception / TimesNet): the time conv then runs
+    once per size in parallel, and the channel conv mixes all of their outputs.
 
     cross_channel = False: the 1x1 channel conv only mixes the bands of the same signal (grouped by signal),
     keeping signals independent inside the tokenizer. Each signal then owns d_model / C dimensions of the
@@ -239,7 +315,7 @@ class SignalTokenizer(nn.Module):
         self,
         in_channels: int,
         d_model: int,
-        kernel_size: int,
+        kernel_size: int | tuple[int, ...],
         ma_windows: tuple[int, ...] = (5, 20, 60),
         n_rank: int = 1,
         time_dim: int = 0,
@@ -247,23 +323,29 @@ class SignalTokenizer(nn.Module):
         cross_channel: bool = True,
         front_end: str = "ma",
         bank_filters: int = 8,
+        raw_skip: bool = False,
     ) -> None:
         super().__init__()
-        assert front_end in ("ma", "conv_bank"), "front_end must be 'ma' or 'conv_bank'"
+        assert front_end in ("ma", "conv_bank", "none"), "front_end must be 'ma', 'conv_bank' or 'none'"
         assert conv_stride >= 1, "conv_stride must be >= 1"
-        assert kernel_size >= conv_stride, "kernel_size must be >= conv_stride so every input step is covered"
+        kernel_sizes = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,)
+        assert min(kernel_sizes) >= conv_stride, "kernel_size must be >= conv_stride so every input step is covered"
         if not cross_channel:
             assert d_model % in_channels == 0, "d_model must be divisible by in_channels when cross_channel=False"
         self.in_channels = in_channels
         self.conv_stride = conv_stride
         self.cross_channel = cross_channel
         # ma_windows sets the moving-average windows, or the kernel sizes of the conv bank
+        self.decomp: MultiScaleDecomp | CausalConvBank | None
         if front_end == "ma":
             self.decomp = MultiScaleDecomp(ma_windows)
-        else:
+        elif front_end == "conv_bank":
             self.decomp = CausalConvBank(in_channels, ma_windows, bank_filters)
-        decomp_channels = self.decomp.num_bands * in_channels  # each signal is split into num_bands bands
-        self.gate = L0Gate(decomp_channels)
+        else:
+            self.decomp = None  # raw signal only: a gate over a single band per signal would be all-or-nothing
+        num_bands = self.decomp.num_bands if self.decomp is not None else 1
+        decomp_channels = num_bands * in_channels  # each signal is split into num_bands bands
+        self.gate = L0Gate(decomp_channels) if self.decomp is not None else None
         self.conv = LowRankCausalConv1d(
             decomp_channels,
             d_model,
@@ -276,6 +358,11 @@ class SignalTokenizer(nn.Module):
         # the tokens. The projection is shared with the decoder's future time features (via embed_time) so the
         # same date means the same thing on both sides. time_dim=0 disables them.
         self.time_proj = nn.Linear(time_dim, d_model) if time_dim > 0 else None
+        # raw_skip: the (RevIN-normalized) input itself also reaches the Transformer. The conv_stride raw steps of
+        # each token's patch, for every signal, are projected to d_model and added to the token, so no
+        # information is lost to the gate, the low-rank conv or the GELU. Adding a projection is the same as
+        # concatenating the raw values as extra token features and projecting the result.
+        self.raw_proj = nn.Linear(in_channels * conv_stride, d_model) if raw_skip else None
 
     def token_positions(self, length: int) -> tuple[int, int]:
         """(offset, stride) such that token j ends at input step offset + j * stride."""
@@ -298,13 +385,22 @@ class SignalTokenizer(nn.Module):
         #   scaling such as (year - base) / 10 or Time2Vec.
         # - Future time features (decoder side) may only contain information known in advance; anything only
         #   observed on that day leaks the future.
-        x = self.gate(self.decomp(input))  # (N, B*C, L), band-major
+        x = input
+        if self.decomp is not None and self.gate is not None:
+            x = self.gate(self.decomp(input))  # (N, B*C, L), band-major
         if not self.cross_channel:
             # Grouped channel conv needs each signal's bands to be contiguous: band-major -> signal-major
             n, _, length = x.shape
             x = x.view(n, -1, self.in_channels, length).transpose(1, 2).reshape(n, -1, length)
         x = F.gelu(self.conv(x))  # (N, d_model, T)
         x = x.transpose(1, 2)  # (N, T, d_model)
+        if self.raw_proj is not None:
+            # Left zero padding to a multiple of the stride aligns patches with the conv: token j covers the
+            # stride steps ending at token_positions(L)[0] + j * stride
+            n, c, length = input.shape
+            raw = F.pad(input, ((-length) % self.conv_stride, 0))  # (N, C, T * s)
+            raw = raw.view(n, c, -1, self.conv_stride).transpose(1, 2).reshape(n, x.size(1), -1)  # (N, T, C * s)
+            x = x + self.raw_proj(raw)
         if time_features is not None:
             # Use the time features of the last input step each token covers
             offset, stride = self.token_positions(input.size(-1))
@@ -312,6 +408,8 @@ class SignalTokenizer(nn.Module):
         return x
 
     def penalty(self) -> torch.Tensor:
+        if self.gate is None:
+            return self.conv.channel_conv.weight.new_zeros(())
         return self.gate.penalty()
 
 
@@ -350,14 +448,28 @@ class SignalDecoder(nn.Module):
         samples_per_output: int = 1,
         text_dim: int = 0,
         latent_signals: int = 1,
+        freq_tokens: bool = False,
+        raw_tokens: bool = False,
+        cross_signals: int = 0,
+        edge_gates: bool = False,
     ) -> None:
         super().__init__()
         # One learnable query per future step (non-autoregressive: all steps are predicted at once).
         # The queries also tell the decoder which step it is predicting.
         self.queries = nn.Parameter(torch.randn(output_length * samples_per_output, d_model) * 0.02)
+        # cross_signals = C > 0: Cross Transformer decoder, a complete graph over C channel-independent signals
+        self.cross_signals = cross_signals
         self.blocks = nn.ModuleList(
-            CrossTransformerBlock(d_model, num_heads, dropout, text_dim=text_dim) for _ in range(num_layers)
+            SignalCrossBlock(
+                d_model, num_heads, dropout, raw_tokens=raw_tokens, edge_gate_signals=cross_signals if edge_gates else 0
+            )
+            if cross_signals > 0
+            else CrossTransformerBlock(
+                d_model, num_heads, dropout, text_dim=text_dim, freq_tokens=freq_tokens, raw_tokens=raw_tokens
+            )
+            for _ in range(num_layers)
         )
+        self.signal_embed = nn.Parameter(torch.randn(cross_signals, d_model) * 0.02) if cross_signals > 0 else None
         self.text_dim = text_dim  # width of external text embeddings; 0 disables text cross-attention
         self.norm = nn.RMSNorm(d_model)
         # Each output step aggregates samples_per_output decoder tokens (e.g. 7 for daily input -> weekly
@@ -380,9 +492,12 @@ class SignalDecoder(nn.Module):
         query_offset: int | None = None,
         memory_offset: int = 0,
         memory_stride: int = 1,
+        freq_memory: torch.Tensor | None = None,
+        raw_memory: torch.Tensor | None = None,
     ) -> torch.Tensor:
         features = self.features(
-            memory, future_time, text_memory, text_padding_mask, query_offset, memory_offset, memory_stride
+            memory, future_time, text_memory, text_padding_mask, query_offset, memory_offset, memory_stride,
+            freq_memory, raw_memory,
         )
         return self.head(features)  # (N, out_channels, output_length)
 
@@ -395,9 +510,12 @@ class SignalDecoder(nn.Module):
         query_offset: int | None = None,
         memory_offset: int = 0,
         memory_stride: int = 1,
+        freq_memory: torch.Tensor | None = None,
+        raw_memory: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Normalized decoder outputs before the head: (N, output_length * samples_per_output, d_model)."""
         # memory: (N, T, d_model) from the encoder
+        # raw_memory: (N, L, d_model), one token per input step; step i sits at position i
         # Positions for RoPE, in input-time units: memory token j sits at memory_offset + j * memory_stride and
         # decoder query k at query_offset + k. query_offset defaults to T (memory at stride 1).
         # future_time: (N, output_length * samples_per_output, d_model), already embedded future time features
@@ -419,6 +537,11 @@ class SignalDecoder(nn.Module):
             y = y + future_time
         if query_offset is None:
             query_offset = memory.size(1)
+        if self.signal_embed is not None:
+            # rows of memory and y are (sample, signal) pairs in sample-major order: row r is signal r % C
+            num_signals, (rows, length, d) = self.cross_signals, memory.shape
+            y = y + self.signal_embed.repeat(rows // num_signals, 1).unsqueeze(1)
+            memory = memory.view(-1, num_signals, length, d) + self.signal_embed.view(1, num_signals, 1, d)
         for block in self.blocks:
             y = block(
                 y,
@@ -428,6 +551,8 @@ class SignalDecoder(nn.Module):
                 memory_stride=memory_stride,
                 text_memory=text_memory,
                 text_padding_mask=text_padding_mask,
+                freq_memory=freq_memory,
+                raw_memory=raw_memory,
             )
         return self.norm(y)
 
@@ -448,6 +573,8 @@ class LowRankCausalConv1d(nn.Module):
     Conv1d, so larger values only add parameters.
     Do not insert an activation between the two convs, otherwise it is no longer a low-rank factorization.
     stride > 1 makes the time conv emit one output per stride input steps (see CausalConv1d).
+    A tuple kernel_size runs one depthwise time conv per size in parallel (all with the same stride, so their
+    outputs stay aligned); the channel conv then mixes n_rank outputs per size and channel.
     channel_groups > 1 splits the channel mixing into independent groups of consecutive input channels.
     """
 
@@ -455,7 +582,7 @@ class LowRankCausalConv1d(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int,
+        kernel_size: int | tuple[int, ...],
         n_rank: int = 1,
         stride: int = 1,
         channel_groups: int = 1,
@@ -464,21 +591,32 @@ class LowRankCausalConv1d(nn.Module):
         assert in_channels % channel_groups == 0 and out_channels % channel_groups == 0, (
             "in_channels and out_channels must be divisible by channel_groups"
         )
+        kernel_sizes = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,)
+        self.n_rank = n_rank
         # groups=in_channels: depthwise, each channel is convolved along time independently, no channel mixing
-        self.time_conv = CausalConv1d(
-            in_channels=in_channels,
-            out_channels=in_channels * n_rank,
-            kernel_size=kernel_size,
-            stride=stride,
-            groups=in_channels,
+        self.time_convs = nn.ModuleList(
+            CausalConv1d(
+                in_channels=in_channels,
+                out_channels=in_channels * n_rank,
+                kernel_size=k,
+                stride=stride,
+                groups=in_channels,
+            )
+            for k in kernel_sizes
         )
         # kernel_size=1: mixes channels at each time step only (equivalent to a per-step Linear), so it
         # is causal by construction. Transposing to (N, L, C) instead would treat time steps as channels and
         # mix in the future.
-        self.channel_conv = nn.Conv1d(in_channels * n_rank, out_channels, kernel_size=1, groups=channel_groups)
+        self.channel_conv = nn.Conv1d(
+            in_channels * n_rank * len(kernel_sizes), out_channels, kernel_size=1, groups=channel_groups
+        )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C_in, L)
-        x = self.time_conv(input)  # (N, C_in * n_rank, T)
+        n, c = input.shape[:2]
+        # (N, C_in * n_rank, T) per kernel size; outputs of the same input channel stay contiguous so channel
+        # groups still see whole input channels: (N, C_in, K, n_rank, T) -> (N, C_in * K * n_rank, T)
+        outs = [conv(input).view(n, c, 1, self.n_rank, -1) for conv in self.time_convs]
+        x = torch.cat(outs, dim=2).flatten(1, 3)
         return self.channel_conv(x)  # (N, C_out, T)
 
 
@@ -518,6 +656,29 @@ class MultiScaleDecomp(nn.Module):
         smooths = [input] + [self._causal_moving_average(input, w) for w in self.windows]
         bands = [fine - coarse for fine, coarse in zip(smooths[:-1], smooths[1:])] + [smooths[-1]]
         return torch.cat(bands, dim=1)
+
+
+class FrequencyEmbedding(nn.Module):
+    """One token per rFFT bin of the input window: (N, C, L) -> (N, L // 2 + 1, d_model).
+
+    The real and imaginary parts of all C signals at a bin are projected to d_model, and a learnable embedding
+    per bin tells the tokens apart (they have no time position, so attention to them uses no RoPE).
+    - Causal: the FFT only covers the input window, which is entirely past data. Each bin mixes the whole
+      window, so these tokens must never enter the causal encoder; the decoder reads them by cross-attention.
+    - Frequency resolution is 1 / L cycles per step: with L = 96 a period of 96 steps sits in bin 1 and longer
+      periods are not resolved. Use a longer input window to see slow cycles.
+    - norm="ortho" keeps bin magnitudes independent of L; the FFT runs in fp32 even under autocast.
+    """
+
+    def __init__(self, in_channels: int, in_len: int, d_model: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(2 * in_channels, d_model)
+        self.bin_embed = nn.Parameter(torch.randn(in_len // 2 + 1, d_model) * 0.02)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C, L)
+        spectrum = torch.fft.rfft(input.float(), dim=-1, norm="ortho")  # (N, C, F) complex
+        x = torch.cat([spectrum.real, spectrum.imag], dim=1).transpose(1, 2)  # (N, F, 2C)
+        return self.proj(x) + self.bin_embed[: x.size(1)]
 
 
 class CausalConvBank(nn.Module):
@@ -722,10 +883,12 @@ class CrossAttention(nn.Module):
 
 
 class CrossTransformerBlock(nn.Module):
-    """Pre-norm decoder block: causal self-attention -> cross-attention -> [text cross-attention] -> FFN.
+    """Pre-norm decoder block: causal self-attention -> cross-attention -> [text cross-attention]
+    -> [frequency cross-attention] -> [raw cross-attention] -> FFN.
 
     Each sub-layer has a residual. The text cross-attention exists only when text_dim > 0 and is skipped when
-    no text_memory is passed.
+    no text_memory is passed; the frequency and raw cross-attentions likewise need freq_tokens / raw_tokens and
+    their memory.
     """
 
     def __init__(
@@ -736,6 +899,8 @@ class CrossTransformerBlock(nn.Module):
         dim_feedforward: int | None = None,
         kv_dim: int | None = None,
         text_dim: int = 0,
+        freq_tokens: bool = False,
+        raw_tokens: bool = False,
     ) -> None:
         super().__init__()
         dim_feedforward = dim_feedforward or 4 * d_model
@@ -750,6 +915,20 @@ class CrossTransformerBlock(nn.Module):
             self.text_attn = CrossAttention(d_model, num_heads, dropout, kv_dim=text_dim, use_rope=False)
         else:
             self.text_attn = None
+        if freq_tokens:
+            # Frequency bins carry no time position, so no RoPE (like text)
+            self.freq_attn_norm = nn.RMSNorm(d_model)
+            self.freq_memory_norm = nn.RMSNorm(d_model)
+            self.freq_attn = CrossAttention(d_model, num_heads, dropout, use_rope=False)
+        else:
+            self.freq_attn = None
+        if raw_tokens:
+            # Raw input steps do have time positions, so RoPE applies (same units as the main memory)
+            self.raw_attn_norm = nn.RMSNorm(d_model)
+            self.raw_memory_norm = nn.RMSNorm(d_model)
+            self.raw_attn = CrossAttention(d_model, num_heads, dropout)
+        else:
+            self.raw_attn = None
         self.ffn_norm = nn.RMSNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
@@ -768,6 +947,8 @@ class CrossTransformerBlock(nn.Module):
         text_padding_mask: torch.Tensor | None = None,
         memory_offset: int = 0,
         memory_stride: int = 1,
+        freq_memory: torch.Tensor | None = None,
+        raw_memory: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # input: (N, L, D), memory: (N, L_kv, kv_dim); offset is the position of the first input element and
         # memory token j sits at memory_offset + j * memory_stride
@@ -791,6 +972,88 @@ class CrossTransformerBlock(nn.Module):
                     key_padding_mask=text_padding_mask,
                 )
             )
+        if self.freq_attn is not None and freq_memory is not None:
+            x = x + self.dropout(self.freq_attn(self.freq_attn_norm(x), self.freq_memory_norm(freq_memory)))
+        if self.raw_attn is not None and raw_memory is not None:
+            x = x + self.dropout(
+                self.raw_attn(self.raw_attn_norm(x), self.raw_memory_norm(raw_memory), query_offset=offset)
+            )
+        return x + self.dropout(self.ffn(self.ffn_norm(x)))
+
+
+class SignalCrossBlock(nn.Module):
+    """Pre-norm block of the Cross Transformer decoder, a complete graph over the signals: causal self-attention
+    -> [raw cross-attention] -> one cross-attention per signal, in signal order -> FFN.
+
+    The queries are the decoder tokens of every (sample, signal) pair, (N * C, L, D); memory holds the encoder
+    output of every signal, (N, C, T, D). For j = 0 .. C - 1, every signal's decoder cross-attends to signal j's
+    memory, each step with its own residual, so the signals are read sequentially in their dataset order.
+    - One cross-attention module (and norm) is shared by all C steps; the signal embedding added to the memory
+      tells the sources apart.
+    - Each step's residual is scaled by 1 / sqrt(C), so the total cross-attention update keeps the same scale
+      whatever the number of signals.
+    - edge_gate_signals = C > 0 replaces that scale with a learnable gate g[i, j] on the update signal i receives
+      from signal j. The softmax of each step always sums to 1, so without gates no signal can learn to ignore
+      another one. The gates start as the identity, so the model starts as plain channel independence (each
+      signal reads its own memory at full weight) and opens cross-signal edges only where they help; an L1
+      penalty on the off-diagonal gates (Signalformer.edge_penalty) keeps the graph sparse.
+    - Cross-attention sees the whole memory, which is past data only; RoPE positions as in CrossTransformerBlock.
+    """
+
+    def __init__(
+        self, d_model: int, num_heads: int, dropout: float = 0.1, raw_tokens: bool = False, edge_gate_signals: int = 0
+    ) -> None:
+        super().__init__()
+        self.self_attn_norm = nn.RMSNorm(d_model)
+        self.self_attn = CausalSelfAttention(d_model, num_heads, dropout)
+        # edge_gate[i, j]: weight of signal j's update to signal i
+        self.edge_gate = nn.Parameter(torch.eye(edge_gate_signals)) if edge_gate_signals > 0 else None
+        if raw_tokens:
+            self.raw_attn_norm = nn.RMSNorm(d_model)
+            self.raw_memory_norm = nn.RMSNorm(d_model)
+            self.raw_attn = CrossAttention(d_model, num_heads, dropout)
+        else:
+            self.raw_attn = None
+        self.cross_attn_norm = nn.RMSNorm(d_model)
+        self.memory_norm = nn.RMSNorm(d_model)
+        self.cross_attn = CrossAttention(d_model, num_heads, dropout)
+        self.ffn_norm = nn.RMSNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        memory: torch.Tensor,
+        offset: int = 0,
+        memory_offset: int = 0,
+        memory_stride: int = 1,
+        raw_memory: torch.Tensor | None = None,
+        **_: object,
+    ) -> torch.Tensor:
+        # input: (N * C, L, D), memory: (N, C, T, D), raw_memory: (N * C, L_in, D)
+        x = input + self.dropout(self.self_attn(self.self_attn_norm(input), offset))
+        if self.raw_attn is not None and raw_memory is not None:
+            x = x + self.dropout(
+                self.raw_attn(self.raw_attn_norm(x), self.raw_memory_norm(raw_memory), query_offset=offset)
+            )
+        n, num_signals, length, d = memory.shape
+        memory = self.memory_norm(memory)
+        scale = num_signals**-0.5
+        if self.edge_gate is not None:
+            assert self.edge_gate.size(0) == num_signals, "edge gates were built for a different number of signals"
+        for j in range(num_signals):
+            # signal j's memory, repeated for the decoder of every signal of the same sample
+            source = memory[:, j : j + 1].expand(-1, num_signals, -1, -1).reshape(n * num_signals, length, d)
+            update = self.cross_attn(
+                self.cross_attn_norm(x), source, query_offset=offset, key_offset=memory_offset, key_stride=memory_stride
+            )
+            if self.edge_gate is not None:
+                # rows are (sample, signal) pairs in sample-major order: row r receives with gate g[r % C, j]
+                weight = self.edge_gate[:, j].repeat(n).view(-1, 1, 1)
+                x = x + weight * self.dropout(update)
+            else:
+                x = x + scale * self.dropout(update)
         return x + self.dropout(self.ffn(self.ffn_norm(x)))
 
 

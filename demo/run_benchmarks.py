@@ -4,9 +4,10 @@
     python demo/run_benchmarks.py --seeds 2021                      # a single seed
     python demo/run_benchmarks.py --datasets ETTm1 Weather --variants base no_revin
     python demo/run_benchmarks.py --pred-lens 96 192 336 720
+    python demo/run_benchmarks.py --datasets FI2010 --lob-horizons 10 50 100
     python demo/run_benchmarks.py --dry-run                         # print the commands only
 
-Each run is a separate `train.py` process; up to --jobs (default 2) run at the same time on the same GPU, and
+Each run is a separate `train.py` process; up to --jobs (default 1) run at the same time on the same GPU, and
 each writes its output to demo/runs/benchmark/logs/. Results go to
 demo/runs/benchmark/<dataset>_<pred_len>_<variant>_s<seed>.json; finished runs are skipped on the next invocation (use
 --rerun to repeat them), so an interrupted sweep resumes where it stopped.
@@ -15,6 +16,9 @@ Variants that resolve to the same configuration for a dataset (e.g. `auto_dmodel
 same width as the preset) are trained once and the result is copied. Runs use torch.compile unless
 --no-compile is given. The summary, including a naive repeat-last-value baseline, is written to
 demo/runs/benchmark/summary.md.
+
+FI2010 is a classification task: its runs use the label horizons of --lob-horizons instead of --pred-lens, and
+the summary gives it a separate table of macro F1 and accuracy, with an always-the-majority-class baseline.
 """
 
 import argparse
@@ -28,14 +32,16 @@ from pathlib import Path
 
 import torch
 
-from datasets import build_splits, num_signals
+from datasets import LOB_DATASETS, build_lob_splits, build_splits, num_signals
 from train import effective_config
 from train import parse_args as parse_train_args
 
 DEMO_DIR = Path(__file__).resolve().parent
 OUT_DIR = DEMO_DIR / "runs" / "benchmark"
 
-DATASETS = ("ETTm1", "ETTm2", "Weather", "Traffic")
+DATASETS = ("ETTm1", "ETTm2", "Weather", "Traffic", "FI2010")
+# Small datasets with many signals per window: where the Cross Transformer variants run
+CROSS_DATASETS = ("ETTm1", "ETTm2", "Weather", "FI2010")
 
 # Extra arguments applied to every variant of a dataset
 DATASET_ARGS = {
@@ -48,6 +54,8 @@ DATASET_ARGS = {
 SHARED = ["--shared", "--no-raw-skip"]
 # Patching with one token per 8 steps (kernel 16, rank 8), the best tokenizer of round 6
 PATCH8 = ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8"]
+# Patching without the moving-average bands: one band, so the rank doubles to 16 to keep the width
+NO_MA = [*PATCH8[:-1], "16", "--front-end", "none"]
 VARIANTS = {
     # Round 1-2: shared token sequence
     "base": SHARED,
@@ -102,7 +110,7 @@ VARIANTS = {
     # Longer patches, patching without the MA decomposition (one band, so rank 16 for the same width), a longer
     # input window, and more dropout against the early overfitting seen with patch8
     "patch16": ["--kernel-size", "32", "--conv-stride", "16", "--n-rank", "16"],
-    "patch8_no_ma": [*PATCH8[:-1], "16", "--front-end", "none"],
+    "patch8_no_ma": NO_MA,
     "patch8_seq336": [*PATCH8, "--seq-len", "336"],
     "patch8_freq_seq336": [*PATCH8, "--seq-len", "336", "--freq-tokens"],
     "patch8_drop": [*PATCH8, "--dropout", "0.3"],
@@ -114,13 +122,37 @@ VARIANTS = {
     "cross_patch8_raw_xattn": ["--architecture", "cross", *PATCH8, "--no-raw-skip", "--raw-tokens"],
     # Learnable gate per (receiving, sending) signal pair, starting as plain channel independence, with L1 sparsity
     "cross_patch8_gate": ["--architecture", "cross", *PATCH8, "--edge-gates"],
+    # Round 8. Signalformer: a longer input, and a wider or deeper model now that patching leaves 1/8 of the tokens
+    "patch8_seq512": [*PATCH8, "--seq-len", "512"],
+    "patch8_d64": [*PATCH8, "--d-model", "64"],
+    "patch8_e2d2": [*PATCH8, "--encoder-layers", "2", "--decoder-layers", "2"],
+    # Gated Cross Transformer: a longer input, raw-input cross-attention, a weaker and a stronger L1 penalty, and
+    # L0 masks on the edges, which can close edges exactly
+    "cross_gate_seq336": ["--architecture", "cross", *PATCH8, "--edge-gates", "--seq-len", "336"],
+    "cross_gate_raw_xattn": ["--architecture", "cross", *PATCH8, "--edge-gates", "--no-raw-skip", "--raw-tokens"],
+    "cross_gate_l1_low": ["--architecture", "cross", *PATCH8, "--edge-gates", "--edge-lambda", "1e-4"],
+    "cross_gate_l1_high": ["--architecture", "cross", *PATCH8, "--edge-gates", "--edge-lambda", "1e-2"],
+    # Round 8 trained the L0 masks at the model learning rate, where they never closed an edge
+    "cross_gate_l0": ["--architecture", "cross", *PATCH8, "--edge-gates", "l0", "--edge-mask-lr", "1e-3"],
+    # Traffic: every run so far stopped at the 10-epoch cap, and stride 4 beat the default stride 8
+    "ci_raw_e20": ["--epochs", "20"],
+    "patch4_e20": ["--kernel-size", "8", "--conv-stride", "4", "--n-rank", "4", "--epochs", "20"],
+    "patch4_seq336": ["--kernel-size", "8", "--conv-stride", "4", "--n-rank", "4", "--seq-len", "336"],
+    # Round 9. L0 edge masks at --gate-lr, and on FI-2010 one token sequence for all order book features as the
+    # counterpart of channel independence
+    "cross_gate_l0_fast": ["--architecture", "cross", *PATCH8, "--edge-gates", "l0"],
+    "shared_patch8": [*SHARED, *PATCH8],
+    # Round 11 (FI-2010): patch8_no_ma, the simplest of the tied round 10 settings, with a lower learning rate, a wider
+    # or deeper model, and the 104 handcrafted features that TLOB and MLPLOB also read
+    "no_ma_lr_low": [*NO_MA, "--lr", "3e-4", "--epochs", "20"],
+    "no_ma_d64": [*NO_MA, "--d-model", "64"],
+    "no_ma_e2d2": [*NO_MA, "--encoder-layers", "2", "--decoder-layers", "2"],
+    "no_ma_f144": [*NO_MA, "--lob-features", "144"],
 }
-# seq336 (round 6) is the reference for patch8_seq336; on Traffic, which always patches by 8, the two are the same
-# configuration and share results. Frequency tokens stay available (--freq-tokens, the freq* variants) but are left
-# out of the default sweep: they only helped at input 336 on two datasets, within noise.
-DEFAULT_VARIANTS = ["ci_raw", "patch8", "seq336", "raw_xattn", "patch8_raw_xattn", "patch8_raw_both", "patch16",
-                    "patch8_no_ma", "patch8_seq336", "patch8_drop", "cross", "cross_raw_xattn", "cross_patch8",
-                    "cross_patch8_raw_xattn", "cross_patch8_gate"]
+# Round 11: FI-2010 at horizons 10, 50 and 100. Round 10 tied the best published macro F1 at horizons 10 and 100
+# but not at 50; these variants look for the missing capacity or inputs. Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
+# they only helped at input 336 on two datasets, within noise.
+DEFAULT_VARIANTS = ["no_ma_lr_low", "no_ma_d64", "no_ma_e2d2", "no_ma_f144"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 # Variants that only run on some datasets (others show "–" in the summary)
 VARIANT_DATASETS = {
@@ -128,12 +160,32 @@ VARIANT_DATASETS = {
     "tree_soft": ("ETTm1", "ETTm2", "Weather"),
     "tree_sampled": ("ETTm1", "ETTm2", "Weather"),
     "ci_proj_nogate": ("Traffic",),
-    # C cross-attentions per decoder layer over C sequences: too costly for Traffic's 862 signals
+    # C cross-attentions per decoder layer over C sequences: too costly for Traffic's 862 signals (cross_patch8
+    # and cross_patch8_gate also run on FI-2010)
     "cross": ("ETTm1", "ETTm2", "Weather"),
     "cross_raw_xattn": ("ETTm1", "ETTm2", "Weather"),
-    "cross_patch8": ("ETTm1", "ETTm2", "Weather"),
+    "cross_patch8": CROSS_DATASETS,
     "cross_patch8_raw_xattn": ("ETTm1", "ETTm2", "Weather"),
-    "cross_patch8_gate": ("ETTm1", "ETTm2", "Weather"),
+    "cross_patch8_gate": CROSS_DATASETS,
+    "cross_gate_seq336": ("ETTm1", "ETTm2", "Weather"),
+    "cross_gate_raw_xattn": ("ETTm1", "ETTm2", "Weather"),
+    "cross_gate_l1_low": ("ETTm1", "ETTm2", "Weather"),
+    "cross_gate_l1_high": ("ETTm1", "ETTm2", "Weather"),
+    "cross_gate_l0": ("ETTm1", "ETTm2", "Weather"),
+    "cross_gate_l0_fast": CROSS_DATASETS,
+    "shared_patch8": ("FI2010",),
+    "no_ma_lr_low": ("FI2010",),
+    "no_ma_d64": ("FI2010",),
+    "no_ma_e2d2": ("FI2010",),
+    "no_ma_f144": ("FI2010",),
+    # Width and depth on the small presets; Traffic already uses d_model 64 and two encoder layers
+    "patch8_d64": ("ETTm1", "ETTm2", "Weather"),
+    "patch8_e2d2": ("ETTm1", "ETTm2", "Weather"),
+    # Longer training and stride 4 are Traffic questions
+    "patch4": ("Traffic",),
+    "ci_raw_e20": ("Traffic",),
+    "patch4_e20": ("Traffic",),
+    "patch4_seq336": ("Traffic",),
 }
 VARIANT_OVERRIDES = {
     # Traffic's "large" doubles its own preset width instead
@@ -157,11 +209,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--datasets", nargs="+", default=list(DATASETS), choices=DATASETS)
     p.add_argument("--pred-lens", nargs="+", type=int, default=[96])
+    p.add_argument("--lob-horizons", nargs="+", type=int, default=[10, 50, 100],
+                   help="FI2010 label horizons (events), used instead of --pred-lens")
     p.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=list(VARIANTS))
     p.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS,
                    help="each configuration runs once per seed; the summary reports mean ± std")
     p.add_argument("--seq-len", type=int, default=96)
-    p.add_argument("--jobs", type=int, default=2, help="runs executed at the same time")
+    p.add_argument("--jobs", type=int, default=1, help="runs executed at the same time")
     p.add_argument("--no-compile", action="store_true", help="do not pass --compile to train.py")
     p.add_argument("--rerun", action="store_true", help="repeat runs that already have a result file")
     p.add_argument("--dry-run", action="store_true", help="print the commands without running them")
@@ -202,8 +256,8 @@ class Job:
 def build_jobs(args: argparse.Namespace) -> list[Job]:
     """All jobs, with each repeated configuration linked to the first job that trains it."""
     jobs, first_by_config = [], {}
-    for pred_len in args.pred_lens:
-        for dataset in args.datasets:
+    for dataset in args.datasets:
+        for pred_len in args.lob_horizons if dataset in LOB_DATASETS else args.pred_lens:
             for variant in args.variants:
                 if dataset not in VARIANT_DATASETS.get(variant, (dataset,)):
                     continue
@@ -239,8 +293,19 @@ def naive_baseline(dataset: str, seq_len: int, pred_len: int) -> tuple[float, fl
     return err.pow(2).mean().item(), err.abs().mean().item()
 
 
+def majority_baseline(dataset: str, seq_len: int, horizon: int) -> tuple[float, float]:
+    """Macro F1 / accuracy of always predicting the most frequent training class, on the test windows."""
+    splits = build_lob_splits(seq_len, horizon)
+    labels = {k: w.labels[w.starts + seq_len - 1] for k, w in splits.items() if k in ("train", "test")}
+    majority = torch.bincount(labels["train"]).argmax()
+    accuracy = (labels["test"] == majority).double().mean().item()
+    f1_majority = 2 * accuracy / (1 + accuracy)  # precision = accuracy, recall = 1; the other classes score 0
+    return f1_majority / torch.bincount(labels["train"]).numel(), accuracy
+
+
 def format_cell(runs: list[tuple[float, float]], num_seeds: int, best: bool) -> str:
-    """'mean MSE ± std / mean MAE'; std is omitted for a single run, and a partial seed count is noted."""
+    """'mean MSE ± std / mean MAE' (FI2010: macro F1 / accuracy); std is omitted for a single run, and a partial
+    seed count is noted."""
     mse = torch.tensor([r[0] for r in runs], dtype=torch.float64)
     mae = sum(r[1] for r in runs) / len(runs)
     text = f"{mse.mean():.3f}"
@@ -261,10 +326,11 @@ def write_summary(args: argparse.Namespace, failures: list[str]) -> str:
         "",
     ]
     columns = ["naive", *args.variants]
-    for pred_len in args.pred_lens:
+    forecasting = [d for d in args.datasets if d not in LOB_DATASETS]
+    for pred_len in args.pred_lens if forecasting else []:
         lines += [f"## Horizon {pred_len}", "", "| Dataset | " + " | ".join(columns) + " |",
                   "|---|" + "---|" * len(columns)]
-        for dataset in args.datasets:
+        for dataset in forecasting:
             scores: dict[str, list[tuple[float, float]]] = {}
             try:
                 scores["naive"] = [naive_baseline(dataset, args.seq_len, pred_len)]  # deterministic
@@ -288,10 +354,40 @@ def write_summary(args: argparse.Namespace, failures: list[str]) -> str:
             ]
             lines.append(f"| {dataset} | " + " | ".join(cells) + " |")
         lines.append("")
+    for dataset in [d for d in args.datasets if d in LOB_DATASETS]:
+        lob_columns = ["majority", *args.variants]
+        lines += [f"## {dataset} (classification)", "",
+                  "Test macro F1 (mean ± std over seeds) / accuracy (mean); 'majority' always predicts the most "
+                  "frequent training class; bold marks the highest mean F1 in each row.", "",
+                  "| Horizon | " + " | ".join(lob_columns) + " |", "|---|" + "---|" * len(lob_columns)]
+        for horizon in args.lob_horizons:
+            scores = {}
+            try:
+                scores["majority"] = [majority_baseline(dataset, args.seq_len, horizon)]
+            except FileNotFoundError:
+                pass
+            for variant in args.variants:
+                runs = []
+                for seed in args.seeds:
+                    path = result_path(dataset, horizon, variant, seed)
+                    if path.exists():
+                        r = json.loads(path.read_text())
+                        runs.append((r["test_f1"], r["test_acc"]))
+                if runs:
+                    scores[variant] = runs
+            means = {c: sum(r[0] for r in runs) / len(runs) for c, runs in scores.items()}
+            best = max(means.values(), default=None)
+            cells = [
+                format_cell(scores[c], 1 if c == "majority" else len(args.seeds), means[c] == best)
+                if c in scores else "–"
+                for c in lob_columns
+            ]
+            lines.append(f"| {horizon} | " + " | ".join(cells) + " |")
+        lines.append("")
     lines += ["## Variants", ""]
     duplicates = []
-    for pred_len in args.pred_lens:
-        for dataset in args.datasets:
+    for dataset in args.datasets:
+        for pred_len in args.lob_horizons if dataset in LOB_DATASETS else args.pred_lens:
             for variant in args.variants:
                 path = result_path(dataset, pred_len, variant, args.seeds[0])
                 if path.exists():

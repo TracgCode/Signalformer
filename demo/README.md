@@ -1,6 +1,6 @@
 # Benchmark demo
 
-Train and evaluate Signalformer on standard long-term forecasting benchmarks: ETTm1, ETTm2, Weather and Traffic.
+Train and evaluate Signalformer on standard long-term forecasting benchmarks (ETTm1, ETTm2, Weather and Traffic) and on FI-2010, a limit order book classification benchmark.
 
 ## Data
 
@@ -15,6 +15,7 @@ python demo/download_data.py
 | ETTm1, ETTm2 | 7 | 15 min | [zhouhaoyi/ETDataset](https://github.com/zhouhaoyi/ETDataset) | CC BY-ND 4.0 |
 | Weather | 21 | 10 min | Max Planck Institute for Biogeochemistry, Jena weather station; benchmark file from [Autoformer](https://github.com/thuml/Autoformer) | See the original provider |
 | Traffic | 862 | 1 hour | California Department of Transportation (PeMS); benchmark file from [Autoformer](https://github.com/thuml/Autoformer) | See the original provider |
+| FI-2010 | 40 | every order book event | Ntakaris et al., *Benchmark Dataset for Mid-Price Forecasting of Limit Order Book Data with Machine Learning Methods* (5 Nasdaq Nordic stocks, 10 days of June 2010); the DecPre files distributed with [DeepLOB](https://github.com/zcakhaa/DeepLOB-Deep-Convolutional-Neural-Networks-for-Limit-Order-Books) | CC BY 4.0 |
 
 Weather and Traffic are fetched from the Autoformer benchmark archive mirrored by [Nixtla datasetsforecast](https://nixtlaverse.nixtla.io/datasetsforecast/long_horizon.html). Check each provider's terms before redistributing the data or results derived from it.
 
@@ -28,18 +29,20 @@ Weather and Traffic are fetched from the Autoformer benchmark archive mirrored b
 - No calendar features by default. Enable them with `--time-features` (any of `hour,dow,doy`). With RevIN they did not help on these benchmarks, and day of year acts as a date ID the model memorizes on datasets spanning one or two years.
 - Reversible instance normalization (RevIN) is on by default; disable with `--no-revin`.
 
+FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3 days test, and the last 20% of every stock's training events validate. The inputs are the 40 order book features (ask / bid price and volume of the 10 best levels), or with `--lob-features 144` also the dataset's 104 handcrafted features, z-scored again with training statistics; no window crosses a stock boundary. The label of a window is the mid-price move (up / stationary / down) of its last event over the next `--pred-len` events (10, 20, 30, 50 or 100). The model averages its decoder features over the decoder steps, concatenates them over the signals and classifies with an FFN head; it trains with cross-entropy, stops early on validation cross-entropy and reports macro F1 and accuracy. The test set is 71% stationary at horizon 10, so accuracy alone is misleading; DeepLOB reports accuracy 84.5% and F1 83.4% at k = 10 in Setup 2, with precision, recall and F1 weighted by class support; the benchmark summary prints macro F1, and EXPERIMENTS.md also gives weighted F1 for that comparison.
+
 ## Benchmark sweep
 
 `run_benchmarks.py` runs every dataset, horizon, variant and seed as a separate `train.py` process and writes a comparison table with a naive repeat-last-value baseline to `demo/runs/benchmark/summary.md`. Scores are reported as mean ± std over seeds, since single-run differences of about 0.01 MSE are within seed noise.
 
-- Up to `--jobs` runs (default 2) share the GPU; each writes its log to `demo/runs/benchmark/logs/`. Without NVIDIA MPS the processes are time-sliced, so the gain comes from filling each other's idle GPU time.
+- Up to `--jobs` runs (default 1) share the GPU; each writes its log to `demo/runs/benchmark/logs/`. Without NVIDIA MPS the processes are time-sliced, so the gain comes from filling each other's idle GPU time.
 - Runs use `torch.compile` unless `--no-compile` is given.
 - Finished runs are skipped on the next call (`--rerun` repeats them), so an interrupted sweep resumes where it stopped.
 - Variants that resolve to the same configuration for a dataset are trained once and the result is copied.
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py                                  # round 7: 4 datasets x horizon 96 x 10 variants x 3 seeds
+python demo/run_benchmarks.py                                  # round 11: FI-2010 at horizons 10, 50 and 100, 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
@@ -49,7 +52,46 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 
 The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-Round 7, the default sweep (`ci_raw`, `patch8` and `seq336` are round 6 references and are not retrained):
+Round 11, the default sweep (FI-2010 only, at horizons 10, 50 and 100; all four start from `patch8_no_ma`):
+
+| Variant | Change from `patch8_no_ma` |
+|---|---|
+| `no_ma_lr_low` | learning rate 3e-4 instead of 1e-3, with 20 epochs instead of 10 (TLOB and MLPLOB train at 1e-4 and 3e-4) |
+| `no_ma_d64` | d_model 64 instead of 32 |
+| `no_ma_e2d2` | two encoder and two decoder layers |
+| `no_ma_f144` | `--lob-features 144`: the 104 handcrafted features of FI-2010 as well, as TLOB and MLPLOB read them |
+
+Round 10 (FI-2010 at horizons 10, 50 and 100, `--lob-horizons`):
+
+| Variant | Change from the defaults |
+|---|---|
+| `patch8`, `cross_gate_l0_fast` | as in round 9, now at horizons 50 and 100 |
+| `patch8_no_ma` | no moving-average bands (`--front-end none`, rank 16): at horizon 10 every band gate closed |
+| `patch8_seq336` | input of 336 events; the strongest published models read 128 (TLOB) and 384 (MLPLOB) |
+
+Round 9 (FI-2010 at horizon 10, and the L0 edge masks again on ETT and Weather):
+
+| Variant | Change from the defaults |
+|---|---|
+| `ci_raw`, `patch8`, `cross_patch8`, `cross_patch8_gate` | as before, now also on FI-2010 |
+| `shared_patch8` | FI-2010 only: all 40 order book features in one token sequence, patching by 8, no raw skip |
+| `cross_gate_l0_fast` | `cross_gate_l0` with the edge masks at `--gate-lr` (1e-2) instead of the model learning rate (ETT, Weather, FI-2010) |
+
+Round 8:
+
+| Variant | Change from the defaults |
+|---|---|
+| `patch8_seq512` | `patch8` with input length 512 |
+| `patch8_d64`, `patch8_e2d2` | `patch8` with d_model 64, or with two encoder and two decoder layers (ETT and Weather only) |
+| `cross_gate_seq336` | `cross_patch8_gate` with input length 336 (ETT and Weather only, as all cross variants) |
+| `cross_gate_raw_xattn` | `cross_patch8_gate` with the raw cross-attention instead of the raw skip |
+| `cross_gate_l1_low`, `cross_gate_l1_high` | `cross_patch8_gate` with `--edge-lambda` 1e-4 or 1e-2 instead of 1e-3 |
+| `cross_gate_l0` | `cross_patch8_gate` with a Hard Concrete mask on every cross-signal edge and an L0 penalty on the fraction of open edges (`--edge-gates l0`, `--edge-lambda` 1e-2) |
+| `ci_raw_e20`, `patch4_e20` | `ci_raw` and `patch4` with 20 epochs instead of 10 (Traffic only) |
+| `patch4_seq336` | `patch4` with input length 336 (Traffic only) |
+| `ci_proj_nogate` | the Traffic collapse diagnostic: `ci_proj` without the gate penalty (Traffic only) |
+
+Round 7:
 
 | Variant | Change from the defaults |
 |---|---|

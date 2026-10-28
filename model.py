@@ -74,14 +74,21 @@ class Signalformer(nn.Module):
     cross-attention comes first. A learnable signal embedding is added to each memory (which signal it comes
     from) and to each signal's decoder queries (which signal is being forecast). Each layer runs C
     cross-attentions over C sequences, so the cost grows with C^2.
-    edge_gates=True adds a learnable C x C gate per decoder layer on the edges of that graph (see
-    SignalCrossBlock); add lam * model.edge_penalty() to the loss to keep the cross-signal edges sparse.
+    edge_gates="l1" (or True) adds a learnable C x C gate per decoder layer on the edges of that graph, with an
+    L1 penalty; edge_gates="l0" adds a Hard Concrete mask to every cross-signal edge, with an L0 penalty that can
+    close edges exactly (see SignalCrossBlock). Add lam * model.edge_penalty() to the loss to keep the
+    cross-signal edges sparse.
 
     output_signals sets the number of forecast signals after the output projection, which maps the C
     per-signal forecasts of every step to output_signals values (with channel_independent=True). 0 or C keeps
     an identity mapping (no parameters, the forecast targets are the input signals); any other value uses a
     per-step FFN across signals (C -> 4 * max(C, output_signals) -> output_signals). It runs after RevIN has
     restored the input scale, since new output signals have no RevIN statistics of their own.
+
+    num_classes > 0 turns the model into a classifier of the whole window: the decoder features are averaged
+    over the decoder steps, the per-signal averages are concatenated (C * d_model with channel independence),
+    and an FFN maps them to num_classes logits. forward then returns (N, num_classes); the forecast head, RevIN
+    denormalization and output projection are skipped. output_length sets the number of decoder steps.
 
     Training: add the gate penalty to the loss, e.g. loss = task_loss + lam * model.penalty().
     """
@@ -115,8 +122,9 @@ class Signalformer(nn.Module):
         freq_tokens: bool = False,
         raw_tokens: bool = False,
         cross_decoder: bool = False,
-        edge_gates: bool = False,
+        edge_gates: bool | str = False,
         output_signals: int = 0,
+        num_classes: int = 0,
     ):
         super().__init__()
         if revin:
@@ -126,8 +134,21 @@ class Signalformer(nn.Module):
         assert not cross_decoder or (channel_independent and ci_latents == 0 and not freq_tokens and text_dim == 0), (
             "cross_decoder requires channel_independent=True without ci_latents, freq_tokens or text"
         )
+        edge_gates = "l1" if edge_gates is True else (edge_gates or "")
+        assert edge_gates in ("", "l1", "l0"), "edge_gates must be False, True, 'l1' or 'l0'"
         assert not edge_gates or cross_decoder, "edge_gates requires cross_decoder=True"
         assert output_signals in (0, in_channels) or channel_independent, "output_signals requires channel_independent"
+        assert num_classes == 0 or output_signals in (0, in_channels), "num_classes replaces the output projection"
+        if num_classes > 0:
+            if channel_independent:
+                width = (ci_latents or in_channels) * d_model
+            else:
+                width = d_model
+            self.class_head: nn.Module | None = nn.Sequential(
+                nn.Linear(width, 4 * d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(4 * d_model, num_classes)
+            )
+        else:
+            self.class_head = None
         if output_signals in (0, in_channels):
             self.output_proj: nn.Module = nn.Identity()
         else:
@@ -237,6 +258,9 @@ class Signalformer(nn.Module):
             # (N * K, L_dec, d) -> (N, L_dec, K * d): the K latents' outputs of each step side by side
             l_dec, d = features.shape[1:]
             features = features.view(batch, num_signals, l_dec, d).transpose(1, 2).reshape(batch, l_dec, -1)
+        if self.class_head is not None:
+            # mean over decoder steps, then the signals side by side: (N, C * d_model) -> (N, num_classes)
+            return self.class_head(features.mean(dim=1).reshape(batch, -1))
         output = self.decoder.head(features)  # (N, out_channels, output_length)
         if self.revin is not None and stats is not None:
             output = self.revin.denormalize(output, stats)
@@ -249,12 +273,15 @@ class Signalformer(nn.Module):
         return self.tokenizer.penalty()
 
     def edge_penalty(self) -> torch.Tensor:
-        """Mean absolute value of the cross-signal edge gates (L1); zero without edge gates."""
-        gates = [b.edge_gate for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None]
-        if not gates:
+        """Mean over decoder layers of SignalCrossBlock.edge_penalty; zero without edge gates."""
+        blocks = [b for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None]
+        if not blocks:
             return self.decoder.queries.new_zeros(())
-        eye = torch.eye(gates[0].size(0), dtype=torch.bool, device=gates[0].device)
-        return torch.stack([g.masked_select(~eye).abs().mean() for g in gates]).mean()
+        return torch.stack([b.edge_penalty() for b in blocks]).mean()
+
+    def edge_weights(self) -> list[torch.Tensor]:
+        """Effective C x C edge weights of every gated decoder layer (masks sampled in training mode)."""
+        return [b.edge_weights() for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None]
 
 
 class RevIN(nn.Module):
@@ -451,7 +478,7 @@ class SignalDecoder(nn.Module):
         freq_tokens: bool = False,
         raw_tokens: bool = False,
         cross_signals: int = 0,
-        edge_gates: bool = False,
+        edge_gates: str = "",
     ) -> None:
         super().__init__()
         # One learnable query per future step (non-autoregressive: all steps are predicted at once).
@@ -461,7 +488,12 @@ class SignalDecoder(nn.Module):
         self.cross_signals = cross_signals
         self.blocks = nn.ModuleList(
             SignalCrossBlock(
-                d_model, num_heads, dropout, raw_tokens=raw_tokens, edge_gate_signals=cross_signals if edge_gates else 0
+                d_model,
+                num_heads,
+                dropout,
+                raw_tokens=raw_tokens,
+                edge_gate_signals=cross_signals if edge_gates else 0,
+                edge_l0=edge_gates == "l0",
             )
             if cross_signals > 0
             else CrossTransformerBlock(
@@ -753,10 +785,14 @@ class L0Gate(nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C, L)
         return input * self.gate_values().view(1, -1, 1)
 
+    def open_probability(self) -> torch.Tensor:
+        """Probability that each channel's gate is nonzero."""
+        shift = self.beta * math.log(-self.gamma / self.zeta)
+        return torch.sigmoid(self.log_alpha - shift)
+
     def penalty(self) -> torch.Tensor:
         """Expected fraction of open channels (differentiable approximation of L0, normalized by count)."""
-        shift = self.beta * math.log(-self.gamma / self.zeta)
-        return torch.sigmoid(self.log_alpha - shift).mean()
+        return self.open_probability().mean()
 
 
 class RotaryEmbedding(nn.Module):
@@ -996,18 +1032,29 @@ class SignalCrossBlock(nn.Module):
       from signal j. The softmax of each step always sums to 1, so without gates no signal can learn to ignore
       another one. The gates start as the identity, so the model starts as plain channel independence (each
       signal reads its own memory at full weight) and opens cross-signal edges only where they help; an L1
-      penalty on the off-diagonal gates (Signalformer.edge_penalty) keeps the graph sparse.
+      penalty on the off-diagonal gates (edge_penalty) keeps the graph sparse.
+    - edge_l0=True multiplies every off-diagonal gate by a Hard Concrete mask (L0Gate) and penalizes the
+      expected fraction of open edges instead, so edges can close exactly and the result is a sparse graph.
+      The self edges are never masked. The gates keep their sign (a signal may push another one down).
     - Cross-attention sees the whole memory, which is past data only; RoPE positions as in CrossTransformerBlock.
     """
 
     def __init__(
-        self, d_model: int, num_heads: int, dropout: float = 0.1, raw_tokens: bool = False, edge_gate_signals: int = 0
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        raw_tokens: bool = False,
+        edge_gate_signals: int = 0,
+        edge_l0: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn_norm = nn.RMSNorm(d_model)
         self.self_attn = CausalSelfAttention(d_model, num_heads, dropout)
         # edge_gate[i, j]: weight of signal j's update to signal i
         self.edge_gate = nn.Parameter(torch.eye(edge_gate_signals)) if edge_gate_signals > 0 else None
+        assert not edge_l0 or edge_gate_signals > 0, "edge_l0 requires edge_gate_signals > 0"
+        self.edge_mask = L0Gate(edge_gate_signals**2) if edge_l0 else None
         if raw_tokens:
             self.raw_attn_norm = nn.RMSNorm(d_model)
             self.raw_memory_norm = nn.RMSNorm(d_model)
@@ -1042,6 +1089,7 @@ class SignalCrossBlock(nn.Module):
         scale = num_signals**-0.5
         if self.edge_gate is not None:
             assert self.edge_gate.size(0) == num_signals, "edge gates were built for a different number of signals"
+            gates = self.edge_weights()
         for j in range(num_signals):
             # signal j's memory, repeated for the decoder of every signal of the same sample
             source = memory[:, j : j + 1].expand(-1, num_signals, -1, -1).reshape(n * num_signals, length, d)
@@ -1050,11 +1098,26 @@ class SignalCrossBlock(nn.Module):
             )
             if self.edge_gate is not None:
                 # rows are (sample, signal) pairs in sample-major order: row r receives with gate g[r % C, j]
-                weight = self.edge_gate[:, j].repeat(n).view(-1, 1, 1)
+                weight = gates[:, j].repeat(n).view(-1, 1, 1)
                 x = x + weight * self.dropout(update)
             else:
                 x = x + scale * self.dropout(update)
         return x + self.dropout(self.ffn(self.ffn_norm(x)))
+
+    def edge_weights(self) -> torch.Tensor:
+        """(C, C) weights of the updates, the gates times the off-diagonal masks (sampled in training mode)."""
+        if self.edge_mask is None:
+            return self.edge_gate
+        eye = torch.eye(self.edge_gate.size(0), dtype=torch.bool, device=self.edge_gate.device)
+        mask = self.edge_mask.gate_values().view_as(self.edge_gate)
+        return self.edge_gate * torch.where(eye, torch.ones_like(mask), mask)
+
+    def edge_penalty(self) -> torch.Tensor:
+        """L1: mean |gate| off the diagonal. L0: expected fraction of open off-diagonal edges."""
+        eye = torch.eye(self.edge_gate.size(0), dtype=torch.bool, device=self.edge_gate.device)
+        if self.edge_mask is None:
+            return self.edge_gate.masked_select(~eye).abs().mean()
+        return self.edge_mask.open_probability().view_as(self.edge_gate).masked_select(~eye).mean()
 
 
 class SelfTransformerBlock(nn.Module):

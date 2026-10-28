@@ -7,6 +7,9 @@
 - Values are z-scored with training-split statistics only.
 - Calendar features default to hour of day and day of week. Day of year is opt-in: on datasets spanning one
   or two years it acts as a date ID that the model memorizes, and test months may never appear in training.
+
+FI-2010 (limit order book, classification) follows Setup 2 of the DeepLOB paper: the first 7 days train, the last
+3 days test. See build_lob_splits.
 """
 
 from dataclasses import dataclass
@@ -49,7 +52,9 @@ def load_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def num_signals(name: str) -> int:
-    """Number of signal columns, read from the CSV header only."""
+    """Number of signal columns, read from the CSV header only (FI-2010: the order book features)."""
+    if name in LOB_DATASETS:
+        return LOB_FEATURES
     with open(DATA_DIR / SPECS[name].path, encoding="latin-1") as f:
         return len(f.readline().split(",")) - 1
 
@@ -130,4 +135,106 @@ def build_splits(
     return {
         split: ForecastWindows(values[start:end], times[start:end], seq_len, pred_len)
         for split, (start, end) in zip(("train", "val", "test"), borders)
+    }
+
+
+# FI-2010: 5 stocks over 10 trading days, one column per order book event. Rows 0-39 are the ask / bid prices and
+# volumes of the 10 best levels (the default features), rows 40-143 the dataset's handcrafted features (spreads,
+# mid-prices, differences, means, accumulated differences, derivatives, intensities), rows 144-148 the labels for
+# the horizons below.
+LOB_DATASETS = ("FI2010",)
+LOB_HORIZONS = (10, 20, 30, 50, 100)
+LOB_FEATURES = 40
+LOB_ALL_FEATURES = 144  # order book + handcrafted features
+LOB_CLASSES = ("up", "stationary", "down")  # file labels 1, 2, 3
+LOB_TRAIN_FILES = ("Train_Dst_NoAuction_DecPre_CF_7.txt",)  # days 1-7
+LOB_TEST_FILES = tuple(f"Test_Dst_NoAuction_DecPre_CF_{i}.txt" for i in (7, 8, 9))  # days 8, 9, 10
+
+
+def load_lob(path: Path) -> np.ndarray:
+    """(149, T) float32 from a whitespace-separated FI-2010 file, cached as <name>.npy next to it."""
+    cache = path.with_suffix(".npy")
+    if cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime:
+        return np.load(cache)
+    data = np.fromfile(path, sep=" ", dtype=np.float32)
+    data = data.reshape(149, -1)
+    np.save(cache, data)
+    return data
+
+
+def lob_segments(ask_price: np.ndarray, jump: float = 0.05) -> list[tuple[int, int]]:
+    """(start, end) of each stock in one file. The files hold the stocks one after another; a stock boundary
+    shows up as a jump of the best ask price by more than `jump` (relative), which never happens within a
+    stock between two consecutive events."""
+    change = np.abs(np.diff(ask_price)) / np.maximum(np.abs(ask_price[:-1]), 1e-8)
+    cuts = [0, *(np.flatnonzero(change > jump) + 1).tolist(), len(ask_price)]
+    return list(zip(cuts[:-1], cuts[1:]))
+
+
+class LobWindows(Dataset):
+    """Classification windows: x (C, seq_len) ending at event t, y = the label of event t (0 up, 1 stationary,
+    2 down). starts lists the first event of every window; no window crosses a stock or file boundary."""
+
+    def __init__(self, values: np.ndarray, labels: np.ndarray, starts: np.ndarray, seq_len: int, horizon: int):
+        self.values = torch.from_numpy(np.ascontiguousarray(values.T))  # (C, T)
+        self.labels = torch.from_numpy(labels)  # (T,)
+        self.starts = torch.from_numpy(starts)  # (num_windows,)
+        self.times = torch.zeros(values.shape[0], 0)
+        self.seq_len, self.pred_len = seq_len, horizon
+
+    def __len__(self) -> int:
+        return len(self.starts)
+
+    def __getitem__(self, i: int):
+        start = int(self.starts[i])
+        return self.values[:, start : start + self.seq_len], self.labels[start + self.seq_len - 1]
+
+
+def build_lob_splits(seq_len: int, horizon: int = 10, val_fraction: float = 0.2,
+                     features: int = LOB_FEATURES) -> dict[str, LobWindows]:
+    """FI-2010 Setup 2 on the DecPre-normalized files, with the first `features` rows (40: the order book, 144:
+    also the handcrafted features) z-scored again with training statistics. The last val_fraction of every stock's training days is the validation split (its
+    windows may start in the training part, as for the forecasting splits). Every event with a full input
+    window inside its stock is one window; the window ends at the event whose label it predicts."""
+    if horizon not in LOB_HORIZONS:
+        raise ValueError(f"FI-2010 horizons are {LOB_HORIZONS}, not {horizon}")
+    if features not in (LOB_FEATURES, LOB_ALL_FEATURES):
+        raise ValueError(f"FI-2010 uses {LOB_FEATURES} or {LOB_ALL_FEATURES} features, not {features}")
+    root = DATA_DIR / "FI2010"
+    missing = [f for f in (*LOB_TRAIN_FILES, *LOB_TEST_FILES) if not (root / f).exists()]
+    if missing:
+        raise FileNotFoundError(f"{root / missing[0]} not found; see the FI-2010 section of demo/README.md")
+    row = 144 + LOB_HORIZONS.index(horizon)
+
+    def load(files: tuple[str, ...]) -> tuple[np.ndarray, np.ndarray, list[tuple[int, int]]]:
+        values, labels, segments, offset = [], [], [], 0
+        for name in files:
+            data = load_lob(root / name)
+            values.append(data[:features].T)
+            labels.append(data[row].astype(np.int64) - 1)
+            segments += [(offset + a, offset + b) for a, b in lob_segments(data[0])]
+            offset += data.shape[1]
+        return np.concatenate(values), np.concatenate(labels), segments
+
+    def window_starts(segments: list[tuple[int, int]]) -> np.ndarray:
+        # windows [s, s + seq_len) inside each segment
+        return np.concatenate([np.arange(a, b - seq_len + 1) for a, b in segments if b - a >= seq_len])
+
+    train_values, train_labels, stocks = load(LOB_TRAIN_FILES)
+    test_values, test_labels, test_segments = load(LOB_TEST_FILES)
+    # The validation part of each stock: its windows end in the last val_fraction of the stock's events
+    train_parts, val_starts = [], []
+    for a, b in stocks:
+        cut = b - int((b - a) * val_fraction)
+        train_parts.append((a, cut))
+        val_starts.append(np.arange(max(a, cut - seq_len + 1), b - seq_len + 1))
+    fit = np.concatenate([train_values[a:b] for a, b in train_parts])
+    mean, std = fit.mean(axis=0), fit.std(axis=0)
+    std = np.where(std < 1e-6, 1.0, std)  # some handcrafted features are constant (all zero) in every file
+    train_values = ((train_values - mean) / std).astype(np.float32)
+    test_values = ((test_values - mean) / std).astype(np.float32)
+    return {
+        "train": LobWindows(train_values, train_labels, window_starts(train_parts), seq_len, horizon),
+        "val": LobWindows(train_values, train_labels, np.concatenate(val_starts), seq_len, horizon),
+        "test": LobWindows(test_values, test_labels, window_starts(test_segments), seq_len, horizon),
     }

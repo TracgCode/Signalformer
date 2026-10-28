@@ -1,0 +1,337 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="1650" viewBox="0 0 1140 1650" font-family="Helvetica, Arial, sans-serif" font-size="13" fill="#222">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#444"/>
+    </marker>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#888"/>
+    </marker>
+    <style>
+      .box { fill: #fff; stroke: #555; stroke-width: 1.2; }
+      .opt { fill: #fafafa; stroke: #888; stroke-width: 1.2; stroke-dasharray: 5 4; }
+      .pill { fill: #f1f1f1; stroke: #555; stroke-width: 1.2; }
+      .line { stroke: #444; stroke-width: 1.5; fill: none; }
+      .optline { stroke: #888; stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+      .title { font-size: 15; font-weight: bold; }
+      .group { font-size: 15; font-weight: bold; }
+      .small { font-size: 11; fill: #555; }
+      .bold { font-weight: bold; }
+      .plus { fill: #fff; stroke: #444; stroke-width: 1.5; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1140" height="1650" fill="#ffffff"/>
+  <text x="570" y="40" text-anchor="middle" font-size="20" font-weight="bold">Signalformer architecture: Cross Transformer</text>
+  <text x="570" y="62" text-anchor="middle" class="small">channel-independent tokenizer + encoder per signal, then a decoder in which every signal cross-attends to every signal (complete graph, C × C edge gates)</text>
+
+  <!-- ===================== LEFT: INPUT, CHANNEL INDEPENDENCE, REVIN ===================== -->
+  <rect x="130" y="100" width="200" height="36" rx="18" class="pill"/>
+  <text x="230" y="123" text-anchor="middle" class="bold">input (N, C, L)</text>
+  <line x1="230" y1="136" x2="230" y2="158" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="160" width="320" height="50" rx="6" class="box"/>
+  <text x="230" y="180" text-anchor="middle" class="bold">channel independence</text>
+  <text x="230" y="198" text-anchor="middle" class="small">reshape (N, C, L) → (N·C, 1, L), all weights shared</text>
+  <line x1="230" y1="210" x2="230" y2="228" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="230" width="320" height="50" rx="6" class="opt"/>
+  <text x="230" y="250" text-anchor="middle" class="bold">RevIN normalize (revin=True)</text>
+  <text x="230" y="268" text-anchor="middle" class="small">own mean / std of each signal's window, affine</text>
+
+  <!-- raw tokens (optional): every normalized input step becomes a decoder memory token -->
+  <rect x="400" y="152" width="130" height="60" rx="6" class="opt"/>
+  <text x="465" y="170" text-anchor="middle" class="small">raw_embed (raw_tokens)</text>
+  <text x="465" y="186" text-anchor="middle" class="small">Linear(1 → d_model)</text>
+  <text x="465" y="202" text-anchor="middle" class="small">(N·C, L, d_model)</text>
+  <path d="M390,250 H465 V214" class="optline" marker-end="url(#arrow-gray)"/>
+  <text x="562" y="360" text-anchor="middle" class="small" transform="rotate(-90 562 360)">raw tokens → raw cross-attention k, v</text>
+
+  <!-- raw skip (optional): normalized input of each patch straight into the token -->
+  <path d="M390,268 H532 V780 H518" class="optline" marker-end="url(#arrow-gray)"/>
+
+  <!-- ===================== LEFT: TOKENIZER ===================== -->
+  <rect x="40" y="300" width="480" height="520" rx="10" fill="#eaf1fd" stroke="#3b6fd4" stroke-width="1.5"/>
+  <text x="56" y="322" class="group" fill="#3b6fd4">SignalTokenizer</text>
+
+  <rect x="70" y="340" width="320" height="70" rx="6" class="box"/>
+  <text x="230" y="360" text-anchor="middle" class="bold">MultiScaleDecomp(w1 &lt; … &lt; wk)</text>
+  <text x="230" y="379" text-anchor="middle" class="small">trailing MAs, bands fine → coarse:</text>
+  <text x="230" y="395" text-anchor="middle" class="small">x−MA1, MA1−MA2, …, MAk → (N·C, B, L), B=k+1</text>
+  <line x1="230" y1="410" x2="230" y2="433" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="435" width="320" height="50" rx="6" class="box"/>
+  <text x="230" y="455" text-anchor="middle" class="bold">L0Gate (Hard Concrete)</text>
+  <text x="230" y="473" text-anchor="middle" class="small">x · z,  z ∈ [0, 1] per band  →  penalty()</text>
+  <line x1="230" y1="485" x2="230" y2="508" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="60" y="510" width="340" height="170" rx="8" fill="#f6f9ff" stroke="#3b6fd4" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="72" y="530" class="bold" fill="#3b6fd4">LowRankCausalConv1d (patch8: n_rank = 8)</text>
+  <rect x="80" y="540" width="300" height="50" rx="6" class="box"/>
+  <text x="230" y="560" text-anchor="middle" class="bold">time_conv: CausalConv1d (depthwise)</text>
+  <text x="230" y="578" text-anchor="middle" class="small">kernel 16, stride 8 → (N·C, 8·B, T), left pad</text>
+  <line x1="230" y1="590" x2="230" y2="608" class="line" marker-end="url(#arrow)"/>
+  <rect x="80" y="610" width="300" height="50" rx="6" class="box"/>
+  <text x="230" y="630" text-anchor="middle" class="bold">channel_conv: Conv1d 1×1</text>
+  <text x="230" y="648" text-anchor="middle" class="small">mixes 8·B → (N·C, d_model, T), T = ceil(L / 8)</text>
+  <line x1="230" y1="680" x2="230" y2="703" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="705" width="320" height="36" rx="6" class="box"/>
+  <text x="230" y="728" text-anchor="middle">GELU → transpose → (N·C, T, d_model)</text>
+  <line x1="230" y1="741" x2="230" y2="768" class="line" marker-end="url(#arrow)"/>
+
+  <circle cx="230" cy="780" r="11" class="plus"/>
+  <text x="230" y="785" text-anchor="middle" class="bold">+</text>
+
+  <rect x="402" y="750" width="114" height="60" rx="6" class="opt"/>
+  <text x="459" y="768" text-anchor="middle" class="small">raw_proj (raw_skip)</text>
+  <text x="459" y="784" text-anchor="middle" class="small">8 raw steps / patch</text>
+  <text x="459" y="800" text-anchor="middle" class="small">Linear → d_model</text>
+  <line x1="402" y1="780" x2="243" y2="780" class="optline" marker-end="url(#arrow-gray)"/>
+
+
+  <!-- ===================== LEFT: ENCODER ===================== -->
+  <rect x="40" y="850" width="480" height="410" rx="10" fill="#e9f6ee" stroke="#2e8b57" stroke-width="1.5"/>
+  <text x="56" y="872" class="group" fill="#2e8b57">SignalEncoder</text>
+
+  <rect x="55" y="885" width="420" height="300" rx="8" fill="#f5fbf7" stroke="#2e8b57" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="242" y="880" class="small">SelfTransformerBlock × num_encoder_layers</text>
+
+  <!-- residual 1 -->
+  <path d="M230,898 H430 V1025 H243" class="line" marker-end="url(#arrow)"/>
+  <rect x="70" y="910" width="320" height="28" rx="6" class="box"/>
+  <text x="230" y="929" text-anchor="middle">RMSNorm</text>
+  <line x1="230" y1="938" x2="230" y2="950" class="line" marker-end="url(#arrow)"/>
+  <rect x="70" y="952" width="320" height="50" rx="6" class="box"/>
+  <text x="230" y="972" text-anchor="middle" class="bold">CausalSelfAttention (multi-head)</text>
+  <text x="230" y="990" text-anchor="middle" class="small">RoPE on q, k · is_causal=True · Dropout</text>
+  <line x1="230" y1="1002" x2="230" y2="1013" class="line" marker-end="url(#arrow)"/>
+  <circle cx="230" cy="1025" r="11" class="plus"/>
+  <text x="230" y="1030" text-anchor="middle" class="bold">+</text>
+
+  <!-- residual 2 -->
+  <line x1="230" y1="1036" x2="230" y2="1053" class="line" marker-end="url(#arrow)"/>
+  <path d="M230,1045 H430 V1160 H243" class="line" marker-end="url(#arrow)"/>
+  <rect x="70" y="1055" width="320" height="28" rx="6" class="box"/>
+  <text x="230" y="1074" text-anchor="middle">RMSNorm</text>
+  <line x1="230" y1="1083" x2="230" y2="1095" class="line" marker-end="url(#arrow)"/>
+  <rect x="70" y="1097" width="320" height="40" rx="6" class="box"/>
+  <text x="230" y="1114" text-anchor="middle" class="bold">FFN</text>
+  <text x="230" y="1130" text-anchor="middle" class="small">Linear(4·d_model) → GELU → Linear · Dropout</text>
+  <line x1="230" y1="1137" x2="230" y2="1148" class="line" marker-end="url(#arrow)"/>
+  <circle cx="230" cy="1160" r="11" class="plus"/>
+  <text x="230" y="1165" text-anchor="middle" class="bold">+</text>
+  <line x1="230" y1="1171" x2="230" y2="1198" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="70" y="1200" width="320" height="28" rx="6" class="box"/>
+  <text x="230" y="1219" text-anchor="middle">RMSNorm (final)</text>
+  <line x1="230" y1="1228" x2="230" y2="1278" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="110" y="1280" width="240" height="36" rx="18" class="pill"/>
+  <text x="230" y="1303" text-anchor="middle" class="bold">memory (N·C, T, d_model)</text>
+
+  <!-- ===================== LEFT: DECODER MEMORY SIDE ===================== -->
+  <rect x="40" y="1336" width="480" height="94" rx="10" fill="#fdf2e6" stroke="#d9822b" stroke-width="1.5"/>
+  <text x="56" y="1358" class="group" fill="#d9822b">Decoder memory side</text>
+  <rect x="70" y="1370" width="320" height="48" rx="6" class="box"/>
+  <text x="230" y="1389" text-anchor="middle" class="bold">+ signal_embed (source signal)</text>
+  <text x="230" y="1407" text-anchor="middle" class="small">view (N·C, T, d) → (N, C, T, d_model)</text>
+
+  <!-- memory of all signals -> cross-signal attention -->
+  <text x="560" y="1050" text-anchor="middle" class="small" transform="rotate(-90 560 1050)">memory of all C signals → cross-attention k, v</text>
+
+  <!-- ===================== RIGHT: DECODER ===================== -->
+  <rect x="580" y="160" width="540" height="1052" rx="10" fill="#fdf2e6" stroke="#d9822b" stroke-width="1.5"/>
+  <text x="596" y="182" class="group" fill="#d9822b">SignalDecoder (cross_signals = C)</text>
+
+  <rect x="622" y="192" width="268" height="50" rx="6" class="box"/>
+  <text x="756" y="212" text-anchor="middle" class="bold">decoder queries (learnable)</text>
+  <text x="756" y="230" text-anchor="middle" class="small">(T_dec, d_model), expanded to N·C rows</text>
+  <rect x="938" y="192" width="172" height="50" rx="6" class="box"/>
+  <text x="1024" y="212" text-anchor="middle" class="bold">signal_embed</text>
+  <text x="1024" y="230" text-anchor="middle" class="small">(C, d_model), learnable</text>
+  <path d="M1024,242 V265 H769" class="line" marker-end="url(#arrow)"/>
+  <text x="900" y="259" text-anchor="middle" class="small">signal being forecast</text>
+  <line x1="756" y1="242" x2="756" y2="253" class="line" marker-end="url(#arrow)"/>
+  <circle cx="756" cy="265" r="11" class="plus"/>
+  <text x="756" y="270" text-anchor="middle" class="bold">+</text>
+  <line x1="756" y1="276" x2="756" y2="318" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="592" y="295" width="333" height="685" rx="8" fill="#fff8f0" stroke="#d9822b" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="607" y="450" text-anchor="middle" class="small" transform="rotate(-90 607 450)">SignalCrossBlock × num_decoder_layers</text>
+
+  <!-- residual 1: self-attention -->
+  <path d="M756,308 H908 V435 H769" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="320" width="268" height="28" rx="6" class="box"/>
+  <text x="756" y="339" text-anchor="middle">RMSNorm</text>
+  <line x1="756" y1="348" x2="756" y2="360" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="362" width="268" height="50" rx="6" class="box"/>
+  <text x="756" y="382" text-anchor="middle" class="bold">CausalSelfAttention</text>
+  <text x="756" y="400" text-anchor="middle" class="small">RoPE pos. L, L+1, … · causal · Dropout</text>
+  <line x1="756" y1="412" x2="756" y2="423" class="line" marker-end="url(#arrow)"/>
+  <circle cx="756" cy="435" r="11" class="plus"/>
+  <text x="756" y="440" text-anchor="middle" class="bold">+</text>
+
+  <!-- residual 2: optional raw-input cross-attention -->
+  <line x1="756" y1="446" x2="756" y2="463" class="line" marker-end="url(#arrow)"/>
+  <path d="M756,455 H908 V580 H769" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="465" width="268" height="28" rx="6" class="opt"/>
+  <text x="756" y="484" text-anchor="middle">RMSNorm (query) · RMSNorm (raw)</text>
+  <line x1="756" y1="493" x2="756" y2="505" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="507" width="268" height="50" rx="6" class="opt"/>
+  <text x="756" y="527" text-anchor="middle" class="bold">Raw CrossAttention (raw_tokens)</text>
+  <text x="756" y="545" text-anchor="middle" class="small">k/v: every input step of the signal · RoPE</text>
+  <line x1="756" y1="557" x2="756" y2="568" class="line" marker-end="url(#arrow)"/>
+  <circle cx="756" cy="580" r="11" class="plus"/>
+  <text x="756" y="585" text-anchor="middle" class="bold">+</text>
+
+  <!-- residual 3: one cross-attention per source signal j, in signal order -->
+  <line x1="756" y1="591" x2="756" y2="638" class="line" marker-end="url(#arrow)"/>
+  <rect x="600" y="598" width="318" height="228" rx="8" fill="#fdf2e6" stroke="#d9822b" stroke-width="1" stroke-dasharray="3 3"/>
+  <text x="610" y="614" class="small bold" fill="#d9822b">for j = 0 … C−1</text>
+  <text x="610" y="629" class="small">(in signal order)</text>
+  <path d="M756,628 H900 V809 H769" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="640" width="268" height="28" rx="6" class="box"/>
+  <text x="756" y="659" text-anchor="middle">RMSNorm (query) · RMSNorm (memory)</text>
+  <line x1="756" y1="668" x2="756" y2="680" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="682" width="268" height="60" rx="6" class="box"/>
+  <text x="756" y="701" text-anchor="middle" class="bold">CrossAttention (shared weights)</text>
+  <text x="756" y="718" text-anchor="middle" class="small">q: decoder rows of all C signals</text>
+  <text x="756" y="733" text-anchor="middle" class="small">k/v: memory of signal j, repeated C× · RoPE</text>
+  <line x1="756" y1="742" x2="756" y2="757" class="line" marker-end="url(#arrow)"/>
+  <circle cx="756" cy="769" r="11" class="plus"/>
+  <text x="756" y="774" text-anchor="middle" class="bold">×</text>
+  <text x="738" y="765" text-anchor="end" class="small">update_j × g[i, j]</text>
+  <text x="738" y="779" text-anchor="end" class="small">no gates: × 1/√C</text>
+  <line x1="756" y1="780" x2="756" y2="797" class="line" marker-end="url(#arrow)"/>
+  <circle cx="756" cy="809" r="11" class="plus"/>
+  <text x="756" y="814" text-anchor="middle" class="bold">+</text>
+
+  <!-- edge gates (optional) -->
+  <rect x="938" y="596" width="172" height="366" rx="6" class="opt"/>
+  <text x="1024" y="616" text-anchor="middle" class="bold">edge gates G (C×C)</text>
+  <text x="1024" y="634" text-anchor="middle" class="small">one per layer, init = identity</text>
+  <text x="1024" y="650" text-anchor="middle" class="small">row i ← column j: g[i, j]</text>
+  <rect x="996" y="662" width="14" height="14" fill="#d9822b" stroke="#555" stroke-width="1"/>
+  <rect x="1010" y="662" width="14" height="14" class="box"/>
+  <rect x="1024" y="662" width="14" height="14" fill="#d9822b" fill-opacity="0.35" stroke="#555" stroke-width="1"/>
+  <rect x="1038" y="662" width="14" height="14" class="box"/>
+  <rect x="996" y="676" width="14" height="14" fill="#d9822b" fill-opacity="0.35" stroke="#555" stroke-width="1"/>
+  <rect x="1010" y="676" width="14" height="14" fill="#d9822b" stroke="#555" stroke-width="1"/>
+  <rect x="1024" y="676" width="14" height="14" class="box"/>
+  <rect x="1038" y="676" width="14" height="14" class="box"/>
+  <rect x="996" y="690" width="14" height="14" class="box"/>
+  <rect x="1010" y="690" width="14" height="14" class="box"/>
+  <rect x="1024" y="690" width="14" height="14" fill="#d9822b" stroke="#555" stroke-width="1"/>
+  <rect x="1038" y="690" width="14" height="14" fill="#d9822b" fill-opacity="0.35" stroke="#555" stroke-width="1"/>
+  <rect x="996" y="704" width="14" height="14" class="box"/>
+  <rect x="1010" y="704" width="14" height="14" fill="#d9822b" fill-opacity="0.35" stroke="#555" stroke-width="1"/>
+  <rect x="1024" y="704" width="14" height="14" class="box"/>
+  <rect x="1038" y="704" width="14" height="14" fill="#d9822b" stroke="#555" stroke-width="1"/>
+  <text x="1024" y="736" text-anchor="middle" class="small">diagonal = self edges</text>
+  <text x="1024" y="752" text-anchor="middle" class="small">shaded = open cross edges</text>
+  <line x1="938" y1="769" x2="770" y2="769" class="optline" marker-end="url(#arrow-gray)"/>
+  <line x1="948" y1="786" x2="1100" y2="786" class="optline"/>
+  <text x="1024" y="804" text-anchor="middle" class="bold">edge_gates = l1</text>
+  <text x="1024" y="821" text-anchor="middle" class="small">penalty: mean |g[i, j]|</text>
+  <text x="1024" y="836" text-anchor="middle" class="small">over i ≠ j (off-diagonal)</text>
+  <line x1="948" y1="850" x2="1100" y2="850" class="optline"/>
+  <text x="1024" y="868" text-anchor="middle" class="bold">edge_gates = l0</text>
+  <text x="1024" y="885" text-anchor="middle" class="small">g[i, j] · m[i, j],  i ≠ j</text>
+  <text x="1024" y="900" text-anchor="middle" class="small">m: Hard Concrete (L0Gate)</text>
+  <text x="1024" y="915" text-anchor="middle" class="small">m[i, i] = 1 (self kept)</text>
+  <text x="1024" y="930" text-anchor="middle" class="small">penalty: E[open fraction]</text>
+  <text x="1024" y="945" text-anchor="middle" class="small">edges can close exactly</text>
+
+  <!-- residual 4: FFN -->
+  <line x1="756" y1="820" x2="756" y2="853" class="line" marker-end="url(#arrow)"/>
+  <path d="M756,840 H908 V958 H769" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="855" width="268" height="28" rx="6" class="box"/>
+  <text x="756" y="874" text-anchor="middle">RMSNorm</text>
+  <line x1="756" y1="883" x2="756" y2="895" class="line" marker-end="url(#arrow)"/>
+  <rect x="622" y="897" width="268" height="40" rx="6" class="box"/>
+  <text x="756" y="914" text-anchor="middle" class="bold">FFN</text>
+  <text x="756" y="930" text-anchor="middle" class="small">Linear(4·d_model) → GELU → Linear · Dropout</text>
+  <line x1="756" y1="937" x2="756" y2="946" class="line" marker-end="url(#arrow)"/>
+  <circle cx="756" cy="958" r="11" class="plus"/>
+  <text x="756" y="963" text-anchor="middle" class="bold">+</text>
+  <line x1="756" y1="969" x2="756" y2="993" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="622" y="995" width="268" height="28" rx="6" class="box"/>
+  <text x="756" y="1014" text-anchor="middle">RMSNorm (final)</text>
+  <line x1="756" y1="1023" x2="756" y2="1038" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="622" y="1040" width="268" height="50" rx="6" class="box"/>
+  <text x="756" y="1060" text-anchor="middle" class="bold">group every s tokens, concatenate</text>
+  <text x="756" y="1078" text-anchor="middle" class="small">(N·C, T_dec, d) → (N·C, H, s·d)</text>
+  <line x1="756" y1="1090" x2="756" y2="1105" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="622" y="1107" width="268" height="50" rx="6" class="box"/>
+  <text x="756" y="1127" text-anchor="middle" class="bold">output_head (FFN)</text>
+  <text x="756" y="1145" text-anchor="middle" class="small">Linear(s·d→4d) → GELU → Linear(→1)</text>
+  <line x1="756" y1="1157" x2="756" y2="1172" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="622" y="1174" width="268" height="28" rx="6" class="box"/>
+  <text x="756" y="1193" text-anchor="middle">transpose → (N·C, 1, H)</text>
+  <line x1="756" y1="1202" x2="756" y2="1227" class="line" marker-end="url(#arrow)"/>
+
+  <!-- ===================== RIGHT: AFTER THE DECODER ===================== -->
+  <rect x="622" y="1229" width="268" height="40" rx="6" class="opt"/>
+  <text x="756" y="1246" text-anchor="middle" class="bold">RevIN denormalize (revin=True)</text>
+  <text x="756" y="1262" text-anchor="middle" class="small">same mean / std as the input window</text>
+  <line x1="756" y1="1269" x2="756" y2="1284" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="622" y="1286" width="268" height="28" rx="6" class="box"/>
+  <text x="756" y="1305" text-anchor="middle">reshape → (N, C, H)</text>
+  <line x1="756" y1="1314" x2="756" y2="1329" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="622" y="1331" width="268" height="40" rx="6" class="opt"/>
+  <text x="756" y="1348" text-anchor="middle" class="bold">output_proj (output_signals ≠ C)</text>
+  <text x="756" y="1364" text-anchor="middle" class="small">per-step FFN across signals, C → output_signals</text>
+  <line x1="756" y1="1371" x2="756" y2="1398" class="line" marker-end="url(#arrow)"/>
+
+  <rect x="586" y="1400" width="340" height="36" rx="18" class="pill"/>
+  <text x="756" y="1423" text-anchor="middle" class="bold">output (N, C, output_length)</text>
+
+  <!-- classification head (optional, replaces the forecast head) -->
+  <path d="M890,1009 H1024 V1238" class="optline" marker-end="url(#arrow-gray)"/>
+  <text x="957" y="1003" text-anchor="middle" class="small">num_classes &gt; 0</text>
+  <rect x="938" y="1240" width="172" height="44" rx="6" class="opt"/>
+  <text x="1024" y="1258" text-anchor="middle" class="small">mean over decoder steps</text>
+  <text x="1024" y="1274" text-anchor="middle" class="small">→ (N·C, d_model)</text>
+  <line x1="1024" y1="1284" x2="1024" y2="1298" class="optline" marker-end="url(#arrow-gray)"/>
+  <rect x="938" y="1300" width="172" height="44" rx="6" class="opt"/>
+  <text x="1024" y="1318" text-anchor="middle" class="small">concatenate the C signals</text>
+  <text x="1024" y="1334" text-anchor="middle" class="small">→ (N, C·d_model)</text>
+  <line x1="1024" y1="1344" x2="1024" y2="1358" class="optline" marker-end="url(#arrow-gray)"/>
+  <rect x="938" y="1360" width="172" height="58" rx="6" class="opt"/>
+  <text x="1024" y="1377" text-anchor="middle" class="small bold">class_head (FFN)</text>
+  <text x="1024" y="1393" text-anchor="middle" class="small">Linear(C·d→4d) → GELU</text>
+  <text x="1024" y="1408" text-anchor="middle" class="small">→ Dropout → Linear</text>
+  <line x1="1024" y1="1418" x2="1024" y2="1434" class="optline" marker-end="url(#arrow-gray)"/>
+  <rect x="938" y="1436" width="172" height="36" rx="14" class="opt"/>
+  <text x="1024" y="1458" text-anchor="middle" class="small bold">logits (N, num_classes)</text>
+
+  <!-- ===================== LEGEND ===================== -->
+  <rect x="40" y="1496" width="1080" height="134" rx="8" fill="#fafafa" stroke="#ccc"/>
+  <text x="56" y="1518" class="bold">Legend</text>
+  <line x1="60" y1="1541" x2="110" y2="1541" class="line" marker-end="url(#arrow)"/>
+  <text x="120" y="1545">tensor flow</text>
+  <line x1="230" y1="1541" x2="280" y2="1541" class="optline" marker-end="url(#arrow-gray)"/>
+  <text x="290" y="1545">optional (revin, raw_skip, raw_tokens, edge_gates, output_signals, num_classes)</text>
+  <circle cx="850" cy="1541" r="9" class="plus"/>
+  <text x="850" y="1545" text-anchor="middle" class="bold" font-size="12">+</text>
+  <text x="866" y="1545">residual</text>
+  <circle cx="950" cy="1541" r="9" class="plus"/>
+  <text x="950" y="1545" text-anchor="middle" class="bold" font-size="12">×</text>
+  <text x="966" y="1545">scaling by edge weight</text>
+  <text x="56" y="1569" class="small">Cross Transformer = channel_independent=True + cross_decoder=True; patch8 = kernel_size 16, conv_stride 8, n_rank 8. Signals interact only in the decoder, through the C cross-attentions per layer (cost ∝ C²).</text>
+  <text x="56" y="1584" class="small">Edge gates start as the identity (plain channel independence) and are learned per decoder layer. Loss = task loss + λ_gate · penalty() + λ_edge · edge_penalty() (mean over decoder layers).</text>
+  <text x="56" y="1599" class="small">Causality: every token at time t depends only on inputs at times ≤ t; decoder cross-attention sees all of memory and the raw tokens, which are entirely past data.</text>
+  <text x="56" y="1614" class="small">N batch, C signals, L input length, B bands, T = ceil(L / 8), T_dec = output_length·s, H = output_length, s = samples_per_output, g[i, j] = weight of signal j's update to signal i.</text>
+  <!-- connectors that cross container borders, drawn last so their arrowheads stay visible -->
+  <line x1="230" y1="280" x2="230" y2="338" class="line" marker-end="url(#arrow)"/>
+  <path d="M530,182 H548 V532 H620" class="optline" marker-end="url(#arrow-gray)"/>
+  <line x1="230" y1="791" x2="230" y2="908" class="line" marker-end="url(#arrow)"/>
+  <line x1="230" y1="1316" x2="230" y2="1368" class="line" marker-end="url(#arrow)"/>
+  <path d="M390,1394 H565 V712 H620" class="line" marker-end="url(#arrow)"/>
+</svg>

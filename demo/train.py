@@ -6,6 +6,11 @@
 Reports MSE / MAE on z-scored test data (the convention used by Informer, Autoformer, PatchTST, ...), and writes
 the result to demo/runs/<dataset>_<pred_len>_<timestamp>.json.
 
+FI2010 is a classification task instead (mid-price up / stationary / down after --pred-len events, one of 10, 20,
+30, 50, 100): the model classifies each input window, trains with cross-entropy and reports accuracy and macro F1.
+
+    python demo/train.py --dataset FI2010 --pred-len 10
+
 Speed: every split is kept on the training device and batches are sliced there directly, without a DataLoader.
 Early stopping checks a fixed, evenly spaced subset of validation windows (--val-windows); the best model is
 then scored on the full validation and test splits, keeping every window (no drop_last).
@@ -26,7 +31,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model import Signalformer  # noqa: E402
 from tree_model import PAIRINGS, TreeSignalformer, correlation_embedding, correlation_tree, random_tree  # noqa: E402
 
-from datasets import TIME_FIELDS, ForecastWindows, build_splits  # noqa: E402
+from datasets import (  # noqa: E402
+    LOB_ALL_FEATURES,
+    LOB_CLASSES,
+    LOB_DATASETS,
+    LOB_FEATURES,
+    LOB_HORIZONS,
+    TIME_FIELDS,
+    ForecastWindows,
+    LobWindows,
+    build_lob_splits,
+    build_splits,
+)
 
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
@@ -37,6 +53,8 @@ PRESETS = {
     "ETTm2": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=64, lr=1e-3),
     "Weather": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=64, lr=1e-3),
     "Traffic": dict(d_model=64, encoder_layers=2, decoder_layers=1, dropout=0.1, batch_size=16, lr=5e-4),
+    # 40 order book features; with channel independence a batch of 64 windows is 2560 sequences
+    "FI2010": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=64, lr=1e-3),
 }
 # Channel independence (the default) runs every signal as its own sequence: Traffic needs smaller batches
 CI_PRESETS = {"Traffic": dict(batch_size=4)}
@@ -49,7 +67,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset", required=True, choices=sorted(PRESETS))
     p.add_argument("--seq-len", type=int, default=96)
-    p.add_argument("--pred-len", type=int, default=96, help="usually 96, 192, 336 or 720")
+    p.add_argument("--pred-len", type=int,
+                   help="forecast horizon, usually 96 (the default), 192, 336 or 720; for FI2010 the label horizon "
+                   f"in events, one of {', '.join(map(str, LOB_HORIZONS))} (default 10)")
+    p.add_argument("--lob-features", type=int, default=LOB_FEATURES, choices=(LOB_FEATURES, LOB_ALL_FEATURES),
+                   help="FI2010 inputs: the 40 order book features, or 144 with the dataset's handcrafted features")
     # Model
     p.add_argument("--d-model", help="a multiple of num_heads * 8; 'auto' for 2 x signals clamped to [32, 256]; "
                    "'half' for signals / 2, at least 32")
@@ -88,11 +110,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # tree: tree-merging architecture (tree_model.py); cross: Cross Transformer, channel-independent encoders and
     # a decoder in which every signal cross-attends to every signal's memory in signal order
     p.add_argument("--architecture", choices=("signalformer", "tree", "cross"), default="signalformer")
-    p.add_argument("--edge-gates", action="store_true",
+    p.add_argument("--edge-gates", nargs="?", const="l1", choices=("l1", "l0"),
                    help="cross architecture: learnable gate per (receiving, sending) signal pair, starting as the "
-                   "identity (plain channel independence)")
-    p.add_argument("--edge-lambda", type=float, default=1e-3,
-                   help="weight of the L1 penalty on the cross-signal edge gates")
+                   "identity (plain channel independence); l1 (the default) penalizes the gate values, l0 adds a "
+                   "Hard Concrete mask per cross-signal edge and penalizes the fraction of open edges")
+    p.add_argument("--edge-lambda", type=float,
+                   help="weight of the edge penalty (default 1e-3 for l1, 1e-2 for l0)")
+    p.add_argument("--edge-mask-lr", type=float,
+                   help="learning rate of the l0 edge masks (default: --gate-lr)")
     p.add_argument("--tree-widths", default="",
                    help="comma-separated width per merge level (multiples of num_heads * 8); the last one repeats; "
                    "empty = d_model at every level")
@@ -119,7 +144,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--muon-momentum", type=float, default=0.95)
     p.add_argument("--scheduler", choices=("cosine", "onecycle"), default="cosine",
                    help="cosine decays from the start; onecycle warms up for the first 10%% of steps")
-    p.add_argument("--patience", type=int, default=3, help="early stopping on validation MSE")
+    p.add_argument("--patience", type=int, default=3,
+                   help="early stopping on validation MSE (cross-entropy for FI2010)")
     p.add_argument("--val-windows", type=int, default=2048,
                    help="validation windows checked each epoch for early stopping (0 = all)")
     p.add_argument("--max-steps", type=int, help="stop each epoch after this many steps (smoke tests)")
@@ -140,6 +166,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p.error("the cross architecture is channel-independent and supports neither --ci-latents nor --freq-tokens")
     if args.edge_gates and args.architecture != "cross":
         p.error("--edge-gates requires --architecture cross")
+    if args.dataset in LOB_DATASETS:
+        if args.pred_len is None:
+            args.pred_len = LOB_HORIZONS[0]
+        if args.pred_len not in LOB_HORIZONS:
+            p.error(f"FI2010 horizons are {', '.join(map(str, LOB_HORIZONS))}")
+        if args.architecture == "tree" or args.time_features != "none":
+            p.error("FI2010 supports neither the tree architecture nor time features")
+    elif args.pred_len is None:
+        args.pred_len = 96
+    if args.edge_lambda is None:
+        args.edge_lambda = 1e-2 if args.edge_gates == "l0" else 1e-3
+    if args.edge_mask_lr is None:
+        args.edge_mask_lr = args.gate_lr
     if args.time_features == "none":
         args.time_fields = ()
     else:
@@ -192,19 +231,28 @@ def effective_config(args: argparse.Namespace, num_signals: int) -> dict:
 
 
 class DeviceWindows:
-    """A split held on the training device; batches of windows are sliced there by index."""
+    """A split held on the training device; batches of windows are sliced there by index.
 
-    def __init__(self, windows: ForecastWindows, device: str, use_time: bool) -> None:
+    Forecasting windows yield (x, y, t_in, t_out) with y (B, C, pred_len); classification windows (LobWindows)
+    yield (x, y, None, None) with y (B,) the class of the window's last event."""
+
+    def __init__(self, windows: ForecastWindows | LobWindows, device: str, use_time: bool) -> None:
         self.values = windows.values.to(device)  # (C, T)
         self.times = windows.times.to(device) if use_time else None  # (T, time_dim)
         self.seq_len = windows.seq_len
-        self.offsets = torch.arange(windows.seq_len + windows.pred_len, device=device)
+        self.labels = windows.labels.to(device) if isinstance(windows, LobWindows) else None  # (T,)
+        self.starts = windows.starts.to(device) if isinstance(windows, LobWindows) else None  # (num_windows,)
+        span = windows.seq_len if self.labels is not None else windows.seq_len + windows.pred_len
+        self.offsets = torch.arange(span, device=device)
         self.num_windows = len(windows)
         self.device = device
 
-    def batch(self, starts: torch.Tensor):
-        positions = starts[:, None] + self.offsets  # (B, seq_len + pred_len)
-        segment = self.values[:, positions].permute(1, 0, 2)  # (B, C, seq_len + pred_len)
+    def batch(self, index: torch.Tensor):
+        starts = self.starts[index] if self.starts is not None else index
+        positions = starts[:, None] + self.offsets  # (B, span)
+        segment = self.values[:, positions].permute(1, 0, 2)  # (B, C, span)
+        if self.labels is not None:
+            return segment, self.labels[starts + self.seq_len - 1], None, None
         x, y = segment[..., : self.seq_len], segment[..., self.seq_len :]
         if self.times is None:
             return x, y, None, None
@@ -241,8 +289,10 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
     gate = [model.tokenizer.gate.log_alpha] if model.tokenizer.gate is not None else []
     pairing = [p for name, p in model.named_parameters()
                if name.startswith(("query_logits", "memory_logits", "pair_embedding"))]
-    # Edge gates start as the identity; weight decay would pull the self edges toward 0
+    # Edge gates start as the identity; weight decay would pull the self edges toward 0. The edge masks need the
+    # faster gate learning rate: at the model learning rate (round 8) they never closed a single edge
     edges = [p for name, p in model.named_parameters() if name.endswith("edge_gate")]
+    masks = [p for name, p in model.named_parameters() if name.endswith("edge_mask.log_alpha")]
     muon_params = []
     if args.optimizer == "muon":
         if isinstance(model, TreeSignalformer):
@@ -250,7 +300,7 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
         else:
             blocks = [*model.encoder.blocks, *model.decoder.blocks]
         muon_params = [m.weight for b in blocks for m in b.modules() if isinstance(m, torch.nn.Linear)]
-    special = {id(p) for p in [*muon_params, *gate, *pairing, *edges]}
+    special = {id(p) for p in [*muon_params, *gate, *pairing, *edges, *masks]}
     adamw_params = [p for p in model.parameters() if id(p) not in special]
     groups = [{"params": adamw_params, "lr": args.lr, "weight_decay": args.weight_decay}]
     if gate:
@@ -259,6 +309,8 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
         groups.append({"params": pairing, "lr": args.pair_lr, "weight_decay": 0.0})
     if edges:
         groups.append({"params": edges, "lr": args.lr, "weight_decay": 0.0})
+    if masks:
+        groups.append({"params": masks, "lr": args.edge_mask_lr, "weight_decay": 0.0})
     optimizers: list[torch.optim.Optimizer] = [torch.optim.AdamW(groups)]
     if muon_params:
         optimizers.append(torch.optim.Muon(
@@ -270,24 +322,48 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
 
 @torch.no_grad()
 def evaluate(forward, model, data: DeviceWindows, batch_size: int, autocast, subset: int = 0,
-             max_steps: int | None = None) -> tuple[float, float]:
+             max_steps: int | None = None) -> dict[str, Any]:
+    """Forecasting: {"loss": MSE, "mse", "mae"}. Classification: {"loss": cross-entropy, "ce", "acc", "f1" (macro),
+    "confusion" (true class x predicted class)}."""
     model.eval()
-    se = torch.zeros((), device=data.device)
+    classify = data.labels is not None
+    loss = torch.zeros((), device=data.device)
     ae = torch.zeros((), device=data.device)
+    confusion = torch.zeros(len(LOB_CLASSES), len(LOB_CLASSES), device=data.device)
     count = 0
     for step, (x, y, t_in, t_out) in enumerate(data.batches(batch_size, subset=subset)):
         if max_steps is not None and step >= max_steps:
             break
         with autocast():
             pred = forward(x, t_in, t_out)
-        err = pred.float() - y  # metrics in fp32
-        se += err.pow(2).sum()
-        ae += err.abs().sum()
-        count += err.numel()
-    return se.item() / count, ae.item() / count  # one host sync per evaluation
+        if classify:
+            loss += torch.nn.functional.cross_entropy(pred.float(), y, reduction="sum")
+            confusion.index_put_((y, pred.argmax(dim=1)), torch.ones_like(y, dtype=confusion.dtype), accumulate=True)
+            count += y.numel()
+        else:
+            err = pred.float() - y  # metrics in fp32
+            loss += err.pow(2).sum()
+            ae += err.abs().sum()
+            count += err.numel()
+    if not classify:
+        mse = loss.item() / count  # one host sync per evaluation
+        return dict(loss=mse, mse=mse, mae=ae.item() / count)
+    confusion = confusion.cpu()
+    tp = confusion.diag()
+    precision = tp / confusion.sum(dim=0).clamp(min=1)
+    recall = tp / confusion.sum(dim=1).clamp(min=1)
+    f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-12)
+    ce = loss.item() / count
+    return dict(loss=ce, ce=ce, acc=(tp.sum() / count).item(), f1=f1.mean().item(), confusion=confusion.tolist())
 
 
-def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.Tensor):
+def describe(metrics: dict[str, Any]) -> str:
+    if "f1" in metrics:
+        return f"ce {metrics['ce']:.4f} acc {metrics['acc']:.4f} f1 {metrics['f1']:.4f}"
+    return f"mse {metrics['mse']:.4f} mae {metrics['mae']:.4f}"
+
+
+def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.Tensor, num_classes: int = 0):
     """Signalformer, or TreeSignalformer with its pairing tree computed from the training split only."""
     common: dict[str, Any] = dict(
         in_channels=num_signals,
@@ -331,6 +407,7 @@ def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.
         raw_tokens=args.raw_tokens,
         cross_decoder=args.architecture == "cross",
         edge_gates=args.edge_gates,
+        num_classes=num_classes,
     )
 
 
@@ -340,14 +417,19 @@ def main() -> None:
     if args.device == "cpu":
         print("warning: training on CPU; this is only practical for smoke tests (--max-steps)")
 
-    splits = build_splits(args.dataset, args.seq_len, args.pred_len, args.time_fields)
+    classify = args.dataset in LOB_DATASETS
+    if classify:
+        splits = build_lob_splits(args.seq_len, args.pred_len, features=args.lob_features)
+    else:
+        splits = build_splits(args.dataset, args.seq_len, args.pred_len, args.time_fields)
     num_signals = splits["train"].values.size(0)
     args.d_model = resolve_d_model(args.d_model, num_signals, args.num_heads)
     args.ci_latents = resolve_ci_latents(args.ci_latents, num_signals)
     use_time = len(args.time_fields) > 0
     train, val, test = (DeviceWindows(splits[s], args.device, use_time) for s in ("train", "val", "test"))
 
-    model = build_model(args, num_signals, splits["train"].values).to(args.device)
+    model = build_model(args, num_signals, splits["train"].values, len(LOB_CLASSES) if classify else 0)
+    model = model.to(args.device)
     num_params = sum(p.numel() for p in model.parameters())
     print(f"{args.dataset}: {num_signals} signals, train/val/test windows = "
           f"{train.num_windows}/{val.num_windows}/{test.num_windows}, params = {num_params:,}")
@@ -401,7 +483,10 @@ def main() -> None:
                 tree_model.pair_temperature = temp_start + (temp_end - temp_start) * progress
             with autocast():
                 pred = forward(x, t_in, t_out)
-                sample_loss = (pred.float() - y).pow(2).mean(dim=(1, 2))  # (B,)
+                if classify:
+                    sample_loss = torch.nn.functional.cross_entropy(pred.float(), y, reduction="none")  # (B,)
+                else:
+                    sample_loss = (pred.float() - y).pow(2).mean(dim=(1, 2))  # (B,)
                 task_loss = sample_loss.mean()
                 loss = task_loss + args.gate_lambda * model.penalty()
                 if args.edge_gates:
@@ -421,14 +506,22 @@ def main() -> None:
                 optimizer.step()
                 scheduler.step()
             total += task_loss.detach()  # summed on the device to avoid a host sync every step
-        train_mse = total.item() / steps_per_epoch
-        val_mse, val_mae = evaluate(forward, model, val, args.batch_size, autocast, args.val_windows, args.max_steps)
-        history.append(dict(epoch=epoch, train_mse=train_mse, val_mse=val_mse, val_mae=val_mae))
+        train_loss = total.item() / steps_per_epoch
+        val_metrics = evaluate(forward, model, val, args.batch_size, autocast, args.val_windows, args.max_steps)
+        val_metrics.pop("confusion", None)
+        history.append(dict(epoch=epoch, train_loss=train_loss, **{f"val_{k}": v for k, v in val_metrics.items()}))
         gates = f"open gates {int((gate.gate_values() > 0).sum())}/{gate.log_alpha.numel()}  " if gate else ""
-        print(f"epoch {epoch:3d}  train {train_mse:.4f}  val mse {val_mse:.4f} mae {val_mae:.4f}  "
+        if args.edge_gates == "l0":
+            model.eval()
+            with torch.no_grad():
+                weights = torch.stack(model.edge_weights())
+            off = ~torch.eye(weights.size(-1), dtype=torch.bool, device=weights.device).expand_as(weights)
+            gates += f"open edges {int((weights[off] != 0).sum())}/{int(off.sum())}  "
+            model.train()
+        print(f"epoch {epoch:3d}  train {train_loss:.4f}  val {describe(val_metrics)}  "
               f"{gates}{time.time() - start:.0f}s")
-        if val_mse < best_val:
-            best_val, bad_epochs = val_mse, 0
+        if val_metrics["loss"] < best_val:
+            best_val, bad_epochs = val_metrics["loss"], 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad_epochs += 1
@@ -439,10 +532,10 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
     # Final scores on the complete validation and test splits
-    full_val_mse, full_val_mae = evaluate(forward, model, val, args.batch_size, autocast, 0, args.max_steps)
-    test_mse, test_mae = evaluate(forward, model, test, args.batch_size, autocast, 0, args.max_steps)
-    print(f"val   mse {full_val_mse:.4f}  mae {full_val_mae:.4f}  (full split)")
-    print(f"test  mse {test_mse:.4f}  mae {test_mae:.4f}")
+    val_metrics = evaluate(forward, model, val, args.batch_size, autocast, 0, args.max_steps)
+    test_metrics = evaluate(forward, model, test, args.batch_size, autocast, 0, args.max_steps)
+    print(f"val   {describe(val_metrics)}  (full split)")
+    print(f"test  {describe(test_metrics)}")
 
     tag = f"_{args.tag}" if args.tag else ""
     out = args.output or RUNS_DIR / f"{args.dataset}_{args.pred_len}{tag}_{time.strftime('%Y%m%d-%H%M%S')}.json"
@@ -450,11 +543,12 @@ def main() -> None:
     model.eval()
     out.write_text(json.dumps(dict(
         args={k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-        num_params=num_params, val_mse=full_val_mse, val_mae=full_val_mae, test_mse=test_mse, test_mae=test_mae,
+        num_params=num_params,
+        **{f"val_{k}": v for k, v in val_metrics.items() if k != "loss"},
+        **{f"test_{k}": v for k, v in test_metrics.items() if k != "loss"},
         history=history, gate_values=gate.gate_values().tolist() if gate else [],
         tree=tree_model.tree if tree_model is not None else None,
-        edge_gates=[b.edge_gate.tolist() for b in model.decoder.blocks if getattr(b, "edge_gate", None) is not None]
-        if args.edge_gates else None,
+        edge_gates=[w.tolist() for w in model.edge_weights()] if args.edge_gates else None,
     ), indent=2))
     print(f"saved {out}")
 

@@ -91,11 +91,11 @@ Shared mode (all signals in one token sequence), MA decomposition, d_model 32 (T
 
 | | ETTm1 | ETTm2 | Weather | Traffic |
 |---|---|---|---|---|
-| Signalformer, input 96 | 0.323 (`patch8`) | 0.182 (`patch8`) | 0.174 (`ci_proj`) | 0.436 (`patch4`) |
-| Signalformer, input 336 | 0.311 (`freq_seq336`) | 0.185 (`seq336`) | 0.154 (`freq_seq336`) | 0.373 (`seq336`) |
+| Signalformer, input 96 | 0.320 (`cross_gate_l0`) | 0.182 (`patch8`) | 0.158 (`cross_gate_raw_xattn`) | 0.436 (`patch4`) |
+| Signalformer, input 336 or 512 | 0.311 (`freq_seq336`) | 0.183 (`patch8_seq512`) | 0.153 (`patch8_seq512`, `cross_gate_seq336`) | 0.373 (`seq336`) |
 | Best reference above (input 96) | 0.329 (PatchTST) | 0.175 (PatchTST) | 0.172 (TimesNet) | 0.395 (iTransformer) |
 
-At input 96 Signalformer now beats every reference on ETTm1, beats DLinear everywhere and PatchTST on Traffic, matches iTransformer and TimesNet on Weather, and trails PatchTST on ETTm2 by 0.007. The input-336 rows should be compared with results at that length (the PatchTST paper reports roughly 0.29 / 0.165 / 0.15 for ETTm1 / ETTm2 / Weather), not with the input-96 references.
+At input 96 Signalformer now beats every reference on ETTm1 and Weather (the Cross Transformer with edge gates, 0.158 against TimesNet's 0.172), beats DLinear everywhere and PatchTST on Traffic, and trails PatchTST on ETTm2 by 0.007. `patch8_seq336` reaches 0.313 / 0.185 / 0.155 at input 336 without frequency tokens. The input-336 rows should be compared with results at that length (the PatchTST paper reports roughly 0.29 / 0.165 / 0.15 for ETTm1 / ETTm2 / Weather), not with the input-96 references.
 
 ## Current defaults
 
@@ -133,9 +133,9 @@ Bold marks the best input-96 score per dataset. Every Traffic run used all 10 ep
 - Input 336 is the largest gain of the round on Traffic: 0.445 → 0.373, well below every input-96 reference (iTransformer 0.395). Frequency tokens add nothing there.
 - The tree architecture loses everywhere, badly on ETTm1 (0.40–0.42 with fixed pairings), while using more parameters. Correlation pairing is no better than random on ETTm1 and only slightly better on Weather, so which channels meet matters less than the fact that they are mixed at all. This matches round 3, where mixing channels hurt ETTm1 most. Learnable pairings recover part of the gap on ETTm1 (0.377), which suggests they learn to soften the mixing, but they do not help on ETTm2 or Weather. On Traffic the tree is far behind (0.59 against 0.445) whatever the pairing, with three times the parameters.
 
-`ci_proj_nogate` (the Traffic collapse diagnostic) has not been run yet.
+`ci_proj_nogate` (the Traffic collapse diagnostic) has not been run yet; it is in round 8.
 
-## Round 7 (prepared, not run yet)
+## Round 7: raw-input cross-attention, patching variants, Cross Transformer (3 seeds)
 
 All on the `ci_raw` defaults. `ci_raw`, `patch8` and `seq336` are references from round 6 and are not retrained. On Traffic, which already patches by 8, the `patch8_*` variants equal their counterparts without the prefix and reuse their results. Frequency tokens are kept as an option (`--freq-tokens`, and the `freq*` variants including `patch8_freq_seq336`) but are off in this and later sweeps: across round 6 they only helped at input 336 on ETTm1 and Weather, by less than the seed spread on ETTm1.
 
@@ -150,8 +150,227 @@ All on the `ci_raw` defaults. `ci_raw`, `patch8` and `seq336` are references fro
 | `cross`, `cross_raw_xattn`, `cross_patch8`, `cross_patch8_raw_xattn` (ETT and Weather) | The Cross Transformer (`--architecture cross`): every signal is tokenized and encoded on its own with shared weights, as in `ci_raw`, but in the decoder every signal cross-attends to the encoder memory of every signal, itself included, one after another in dataset order (a complete graph). With `--raw-tokens` the raw-input cross-attention comes first. One cross-attention module per layer is shared by all signals, a learnable signal embedding marks the source memory and the signal being forecast, and each per-signal residual is scaled by 1/sqrt(C). Compared with `ci_raw`, `raw_xattn`, `patch8` and `patch8_raw_xattn`, which have the same tokenizer and encoder but no exchange between signals. Unlike the tree, each signal keeps its own decoder, so this tests cross-signal information without the bottleneck of merging. It costs C cross-attentions per layer, so Traffic is skipped. |
 | `cross_patch8_gate` (ETT and Weather) | `cross_patch8` with edge gates (`--edge-gates`): the 1/sqrt(C) scale is replaced by a learnable C x C gate per decoder layer on the update each signal receives from each signal. Every per-signal softmax sums to 1, so without gates a signal cannot learn to ignore another one; the gates start as the identity (plain channel independence) and have an L1 penalty on the cross-signal edges (`--edge-lambda`, default 1e-3, no weight decay). The learned gates are saved in the result JSON. |
 
+Results (the Cross Transformer variants were not run on Traffic; `patch4`, the best Traffic score at input 96, is 0.436 from round 6):
+
+| Variant | ETTm1 | ETTm2 | Weather | Traffic |
+|---|---|---|---|---|
+| `ci_raw` (reference) | 0.334 ± 0.001 | 0.192 ± 0.002 | 0.178 ± 0.001 | 0.445 ± 0.002 |
+| `patch8` (reference) | 0.323 ± 0.007 | **0.182 ± 0.001** | 0.175 ± 0.001 | = `ci_raw` |
+| `seq336` (reference) | 0.317 ± 0.013 | 0.185 ± 0.003 | 0.158 ± 0.005 | 0.373 ± 0.003 |
+| `raw_xattn` | 0.340 ± 0.007 | 0.187 ± 0.004 | 0.177 ± 0.005 | 0.452 ± 0.021 |
+| `patch8_raw_xattn` | 0.334 ± 0.010 | **0.182 ± 0.001** | 0.175 ± 0.001 | = `raw_xattn` |
+| `patch8_raw_both` | 0.327 ± 0.010 | 0.183 ± 0.000 | 0.177 ± 0.007 | **0.443 ± 0.004** |
+| `patch16` | 0.331 ± 0.004 | 0.183 ± 0.001 | 0.176 ± 0.001 | 0.456 ± 0.001 |
+| `patch8_no_ma` | 0.334 ± 0.018 | 0.183 ± 0.001 | 0.176 ± 0.002 | 0.447 ± 0.001 |
+| `patch8_seq336` | 0.313 ± 0.009 | 0.185 ± 0.006 | 0.155 ± 0.001 | = `seq336` |
+| `patch8_drop` | 0.335 ± 0.003 | 0.183 ± 0.001 | 0.178 ± 0.001 | 0.486 ± 0.014 |
+| `cross` | 0.377 ± 0.005 | 0.202 ± 0.003 | 0.184 ± 0.001 | – |
+| `cross_raw_xattn` | 0.343 ± 0.011 | 0.190 ± 0.005 | 0.163 ± 0.002 | – |
+| `cross_patch8` | 0.362 ± 0.004 | 0.192 ± 0.001 | 0.185 ± 0.002 | – |
+| `cross_patch8_raw_xattn` | 0.336 ± 0.007 | 0.190 ± 0.004 | 0.162 ± 0.002 | – |
+| `cross_patch8_gate` | **0.322 ± 0.002** | 0.185 ± 0.003 | **0.160 ± 0.001** | – |
+
+Bold marks the best input-96 score per dataset. Parameter counts on ETT: `patch8` 38,951, `cross_patch8` 39,175, `cross_patch8_raw_xattn` 43,239, `cross_patch8_gate` 39,224 (Weather: 39,623 and 40,064 for the last two cross variants).
+
+- The Cross Transformer with edge gates is the best input-96 model on Weather by a wide margin: 0.175 → 0.160, close to `seq336` (0.158) from 96 input steps, with 270 more parameters than `patch8`. On ETTm1 it ties `patch8` (0.322 against 0.323) with a third of the spread; on ETTm2 it is slightly worse (0.185 against 0.182).
+- Without gates, cross-signal attention hurts on ETT (`cross_patch8` ETTm1 0.362, against 0.323 for `patch8`) and on Weather unless raw tokens are added. With the 1/sqrt(C) scale every signal must take in every other signal, because each per-source softmax sums to 1, and on ETT that forced mixing costs as much as it did in round 3. The raw-input cross-attention softens it (ETTm1 0.362 → 0.336, Weather 0.185 → 0.162), probably because it gives each signal a path to its own values that the mixing cannot dilute. The gates solve the same problem directly, by letting a signal ignore the others, and do better without raw tokens.
+- The learned gates make physical sense and are almost identical across seeds (the decoder has one layer). On ETTm1 the HUFL and MUFL loads take about 0.5 from each other, as do HULL and MULL, while OT keeps a self gate of 1.15 and takes almost nothing from the loads (|g| ≤ 0.1). On Weather the strongest edges are among the radiation signals (SWDR, PAR, max. PAR, 0.45 to 0.57) and from rain to raining (0.4); OT again takes little from the others (mean |g| 0.06). The L1 penalty at 1e-3 leaves the mean off-diagonal |g| at 0.10 to 0.12, so most weak edges are not pruned to zero.
+- Raw-input cross-attention adds nothing in channel-independent mode: `raw_xattn` 0.340 against `ci_raw` 0.334 on ETTm1, and the patch-8 versions equal or trail `patch8`. The 12 patch tokens with the raw skip already carry what the model uses.
+- `patch16` is slightly worse than `patch8` on all three datasets, so stride 8 stays.
+- Removing the MA decomposition from `patch8` costs ETTm1 0.323 → 0.334 with a large spread (± 0.018) and does nothing on ETTm2 and Weather. With patching the decomposition is worth keeping.
+- Patching and input 336 add up on ETTm1 (0.317 → 0.313) and Weather (0.158 → 0.155), matching `freq_seq336` without frequency tokens.
+- Dropout 0.3 is slightly worse everywhere, so the early rise of the `patch8` validation loss is not fixed by more dropout.
+- On Traffic, stride 16 is worse again (0.456), which completes the stride ranking there: 4 (0.436) < 1 (0.441) < 8 (0.445) < 16 (0.456). Dropping the MA (0.447) changes nothing. The raw cross-attention gives 0.441 and 0.439 on two seeds but 0.476 on the third, and with the raw skip kept (`patch8_raw_both`, 0.443) it is within noise of the reference. Dropout 0.3 hurts badly (0.486 ± 0.014, training loss 0.297 against about 0.266): every Traffic run still stops at the 10-epoch cap, so Traffic is underfitting rather than overfitting.
+- The L0 gate closes one to four of the four front-end bands in many Traffic runs, but closed bands do not track the score (`patch8_raw_both` with all four closed scores 0.447), so they do not explain the `raw_xattn` outlier.
+
+Next candidates: edge gates with input 336 and with raw tokens, a sweep of `--edge-lambda`, and a cheaper sparse version of the gated decoder for Traffic (862 signals).
+
+## Round 8: longer input, width and depth, gated Cross Transformer variants, L0 edges (3 seeds)
+
+`ci_raw`, `patch8`, `patch8_seq336`, `cross_patch8_gate` and, on Traffic, `patch4` are references from earlier rounds and are not retrained. Horizon 96 first; the longer horizons (192, 336, 720) follow for the best Signalformer and Cross Transformer settings.
+
+| Variant | Question |
+|---|---|
+| `patch8_seq512` | Input 336 was the largest gain so far. Does 512 help further (64 tokens with patching)? |
+| `patch8_d64`, `patch8_e2d2` (ETT and Weather) | Patching leaves an eighth of the tokens. Does a wider (d_model 64) or deeper (two encoder and two decoder layers) model help now? Round 2 found larger models overfit, but with one token per step. |
+| `cross_gate_seq336` (ETT and Weather, as every cross variant) | Do cross-signal edges and a longer input add up? |
+| `cross_gate_raw_xattn` | Without gates the raw cross-attention helped the Cross Transformer a lot. Does it still help with gates? |
+| `cross_gate_l1_low`, `cross_gate_l1_high` | L1 weight 1e-4 and 1e-2 instead of 1e-3, which left the mean off-diagonal gate at 0.10 to 0.12. |
+| `cross_gate_l0` | L0 instead of L1 (`--edge-gates l0`): every off-diagonal gate is multiplied by a Hard Concrete mask, and the penalty is the expected fraction of open edges (`--edge-lambda` 1e-2 by default), so edges can close exactly and the graph becomes sparse. The gates keep their sign and the self edges are never masked. The masks train at the model learning rate, not the faster `--gate-lr`, so the penalty cannot close them before the gates have learned anything. The JSON stores the effective weights, gate times mask. |
+| `ci_raw_e20`, `patch4_e20` (Traffic) | Every Traffic run so far stopped at the 10-epoch cap. How much does 20 epochs help, and does stride 4 still beat stride 8? |
+| `patch4_seq336` (Traffic) | The two best Traffic settings together. |
+| `ci_proj_nogate` (Traffic) | The pending diagnostic of the round 5 collapse. |
+
+Results on ETT and Weather (the Traffic variants have not been run yet):
+
+| Variant | ETTm1 | ETTm2 | Weather |
+|---|---|---|---|
+| `patch8` (reference) | 0.323 ± 0.007 | **0.182 ± 0.001** | 0.175 ± 0.001 |
+| `patch8_seq336` (reference) | **0.313 ± 0.009** | 0.185 ± 0.006 | 0.155 ± 0.001 |
+| `cross_patch8_gate` (reference) | 0.322 ± 0.002 | 0.185 ± 0.003 | 0.160 ± 0.001 |
+| `patch8_seq512` | 0.317 ± 0.003 | 0.183 ± 0.004 | **0.153 ± 0.005** |
+| `patch8_d64` | 0.327 ± 0.009 | **0.182 ± 0.003** | 0.173 ± 0.001 |
+| `patch8_e2d2` | 0.329 ± 0.010 | 0.183 ± 0.002 | 0.174 ± 0.001 |
+| `cross_gate_seq336` | 0.317 ± 0.012 | 0.185 ± 0.007 | **0.153 ± 0.002** |
+| `cross_gate_raw_xattn` | 0.333 ± 0.001 | 0.184 ± 0.002 | 0.158 ± 0.001 |
+| `cross_gate_l1_low` | 0.322 ± 0.002 | 0.185 ± 0.003 | 0.160 ± 0.001 |
+| `cross_gate_l1_high` | 0.321 ± 0.002 | 0.184 ± 0.003 | 0.159 ± 0.001 |
+| `cross_gate_l0` | 0.320 ± 0.004 | 0.182 ± 0.001 | 0.160 ± 0.002 |
+
+- Input 512 helps little over 336: Weather 0.155 → 0.153 (one seed 0.149, the PatchTST input-512 level), ETTm2 0.185 → 0.183, ETTm1 0.313 → 0.317. The gain from a longer input is mostly used up at 336.
+- A wider or deeper model does not help on ETTm1 (0.327 and 0.329 against 0.323, with larger spreads) and is neutral on ETTm2. On Weather, with 21 signals, both gain a little (0.175 → 0.173 / 0.174). `patch8_e2d2` has 68,519 parameters against 38,951.
+- The gated Cross Transformer and input 336 add up on Weather only: 0.153 ± 0.002, tied with `patch8_seq512` and better than either part alone (0.160 and 0.155). On ETTm1 it equals `patch8_seq336` within a larger spread, on ETTm2 nothing changes.
+- With gates, the raw-input cross-attention hurts ETTm1 (0.322 → 0.333) but helps Weather (0.160 → 0.158), the best input-96 Weather score so far.
+- The L1 weight hardly matters: 1e-4, 1e-3 and 1e-2 all give 0.321–0.322 on ETTm1, 0.184–0.185 on ETTm2 and 0.159–0.160 on Weather.
+- The L0 edges did not close a single edge (42/42 open on ETT, 420/420 on Weather, in every run), and the learned weights match the L1 gates (HUFL/MUFL and HULL/MULL about 0.5, OT reading mostly itself). The masks start at log_alpha 2 and must fall to about -2.4 before an edge is exactly 0; at the model learning rate (1e-3), with a penalty gradient far smaller than the task gradient, ten epochs are not enough. So `cross_gate_l0` is in effect an L1 gate with a little mask noise, and its scores (ETTm1 0.320, ETTm2 0.182) should not be read as an L0 result. A real test needs the masks at the faster `--gate-lr` (1e-2) or a lower initial log_alpha.
+
 ```bash
-python demo/run_benchmarks.py                                       # round 7
+python demo/run_benchmarks.py                                       # round 8
 python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather        # the fast datasets first
-python demo/run_benchmarks.py --datasets Traffic --variants ci_proj_nogate --seeds 2021
 ```
+
+## Round 9: FI-2010 and the L0 edges again (3 seeds)
+
+FI-2010 is the first financial dataset and the first classification task: from the 40 order book features (10 ask and 10 bid levels, price and volume) of the last 96 events, predict whether the mid-price moves up, stays or moves down over the next 10 events. Setup 2 of DeepLOB (7 days train, 3 days test); see the README for the protocol. It is a step toward M6-style tasks, which also need class probabilities instead of point forecasts. The classifier averages the decoder features over the decoder steps and concatenates them over the signals, so with channel independence the classification head is the only place where the order book levels meet; the Cross Transformer lets them exchange information before that.
+
+The test set is 71% stationary (training 61%), so always predicting "stationary" gives 71% accuracy but a macro F1 of about 0.28; macro F1 is the main score. DeepLOB reports accuracy 84.47% and F1 83.40% at k = 10 with an input of 100 events (Setup 2, Table II). Its recall equals its accuracy, so its precision, recall and F1 are weighted by class support, not macro averages; compare it with our weighted F1. (F1 77.66% / accuracy 78.91% is its Setup 1 result.)
+
+| Variant | Question |
+|---|---|
+| `ci_raw`, `patch8` | Channel independence on order book data, where the levels are strongly coupled. |
+| `shared_patch8` | All 40 features in one token sequence, the counterpart that mixes the levels from the first layer. |
+| `cross_patch8`, `cross_patch8_gate` | The Cross Transformer with 40 signals (1,560 cross-signal edges), without and with L1 gates. |
+| `cross_gate_l0_fast` (also ETT and Weather) | L0 edge masks at `--gate-lr` (1e-2). In round 8 the masks trained at the model learning rate and never closed an edge. On a synthetic task where only one edge matters (signal 0 is signal 1 delayed), this setting closes the 11 other edges within about 1,500 steps and keeps that one at weight 0.70. On FI-2010, the open edges show which order book levels the model reads. |
+
+The round 8 Traffic variants are deferred.
+
+Results on FI-2010, k = 10, test set. Weighted F1 (by class support) is the metric DeepLOB reports; the published rows are copied from DeepLOB's Setup 2 table (input 100 events).
+
+| Model | Weighted F1 | Macro F1 | Accuracy | Seconds per epoch |
+|---|---|---|---|---|
+| *Always "stationary"* | *0.587* | *0.276* | *0.708* | |
+| *LSTM (Tsantekidis et al. 2017)* | *0.663* | | | |
+| *B(TABL) (Tran et al. 2018)* | *0.692* | | *0.789* | |
+| *C(TABL) (Tran et al. 2018)* | *0.776* | | *0.847* | |
+| *DeepLOB (Zhang et al. 2019)* | *0.834* | | *0.845* | |
+| `ci_raw` | 0.866 ± 0.004 | 0.801 ± 0.008 | 0.870 | ~25 |
+| `patch8` | 0.873 ± 0.001 | 0.811 ± 0.001 | 0.876 | ~20 |
+| `shared_patch8` | 0.708 ± 0.112 | 0.518 ± 0.219 | 0.763 | ~8 |
+| `cross_patch8` | 0.870 ± 0.002 | 0.804 ± 0.005 | 0.877 | ~220 |
+| `cross_patch8_gate` | **0.874 ± 0.000** | 0.811 ± 0.001 | **0.879** | ~215 |
+| `cross_gate_l0_fast` | **0.874 ± 0.000** | **0.812 ± 0.001** | 0.878 | ~215 |
+
+Stronger LOB models at k = 10. Published F1 scores mix two metrics: the papers up to 2022 report weighted F1 (their recall equals their accuracy), while the LOBCAST benchmark (Prata et al. 2024) and TLOB (Berti et al. 2025) retrain every model in one framework and report macro F1. The macro rows are the fair comparison for our macro F1.
+
+| Model | Source | F1 type | k = 10 F1 | Input | Notes |
+|---|---|---|---|---|---|
+| *DeepLOB* | own paper, Setup 2 | weighted | *0.834* | 100 events, 40 features | |
+| *Axial-LOB (2022)* | own paper, 7/3 days | weighted | *0.851* | 40 features | |
+| *TransLOB (2020)* | own paper, 7/3 days | weighted | *0.887* | 100 events | LOBCAST could not reproduce it: 59.4 against a claimed 87.3 averaged over horizons, the largest gap in the benchmark |
+| *DeepLOB* | TLOB table, retrained | macro | *0.711* | | 10 points below its own paper |
+| *Axial-LOB* | TLOB table, retrained | macro | *0.732* | | |
+| *BiN-CTABL (2021)* | TLOB table, retrained | macro | *0.811* | | the most robust model in LOBCAST (score 99.7) |
+| *TLOB (2025)* | own paper | macro | *0.816* | 128 events, 144 features | 40 order book + 104 handcrafted features (about +1 F1) |
+| *MLPLOB (2025)* | own paper | macro | ***0.816*** | 384 events, 144 features | best published k = 10 macro F1 found |
+| `cross_gate_l0_fast` | this round | macro | 0.812 ± 0.001 | 96 events, 40 features | |
+| `patch8` | this round | macro | 0.811 ± 0.001 | 96 events, 40 features | |
+
+- Against the retrained macro F1 scores, our best runs (0.811 to 0.812) tie BiN-CTABL (0.811), TLOB (0.8155) and MLPLOB (0.8164) at k = 10, with only the 40 raw order book features and a shorter input. TLOB and MLPLOB pull ahead at the longer horizons (k = 50: 0.900 / 0.914, k = 100: 0.928 / 0.926), where BiN-CTABL also reaches 0.877 and 0.921; k = 50 and 100 are the next test.
+- The weighted F1 of the older papers is not comparable with these, and it flatters the score on this data: our own runs give 0.874 weighted against 0.812 macro.
+- T-KAN (2026) reports macro F1 on FI-2010 only for its own re-implemented baselines, under a different split; it is not a reference.
+
+`cross_gate_l0_fast` on ETT and Weather (MSE, horizon 96):
+
+| Variant | ETTm1 | ETTm2 | Weather |
+|---|---|---|---|
+| *PatchTST (2023)* | *0.329* | *0.175* | *0.177* |
+| *iTransformer (2024)* | *0.334* | *0.180* | *0.174* |
+| *TimeXer (2024)* | *0.318* | *0.171* | *0.157* |
+| *CycleNet (2024)* | *0.319* | *0.163* | *0.158* |
+| *TQNet (2025)* | *0.311* | *0.173* | *0.157* |
+| *PAMNet (2026)* | *0.308* | *0.165* | *0.154* |
+| `cross_patch8_gate` (reference) | 0.322 ± 0.002 | 0.185 ± 0.003 | 0.160 ± 0.001 |
+| `cross_gate_l0` (round 8, masks at 1e-3) | 0.320 ± 0.004 | 0.182 ± 0.001 | 0.160 ± 0.002 |
+| `cross_gate_l0_fast` | 0.321 ± 0.006 | 0.185 ± 0.004 | 0.159 ± 0.002 |
+
+- On the same metric, every channel-independent or cross variant beats DeepLOB's Setup 2 result: weighted F1 0.866 to 0.874 against 0.834, accuracy 0.870 to 0.879 against 0.845. The comparison is not exact: the input is 96 events instead of 100, and our validation split (the last 20% of each stock's training days) and early stopping differ from the paper. Stronger published models are compared in the next table. The macro F1 comparisons below are among our own variants. The best scores are tied within the seed spread: `patch8` 0.811, `cross_patch8_gate` 0.811, `cross_gate_l0_fast` 0.812. Patching helps channel independence (0.801 → 0.811) and the gates help the Cross Transformer (0.804 → 0.811), but exchanging information between the order book levels before the classifier adds nothing over channel independence, at about ten times the cost per epoch.
+- `shared_patch8` is unstable: 0.705, 0.276 and 0.572. The seed at 0.276 predicts only "stationary". Mixing all 40 features in one token from the first layer is the worst choice on this data.
+- The fixed L0 masks now close edges. On FI-2010, 1,452 of 4,680 cross-signal edges stay open (31%; 449 to 525 per seed), and F1 equals the L1 gates. The level-1 features (best ask and bid, price and volume) are the source of 67 to 94 open edges against 32 to 55 for each deeper level; across feature types the volumes, bid volume above all, lose more edges than the prices. On ETT 31 of 126 edges stay open and on Weather 727 of 1,260; the MSE is unchanged against the L1 gates. Sparse edges cost nothing, but they do not improve the score either.
+- The band gates close completely on FI-2010: all four L0 band gates of the MA decomposition end at 0 in `ci_raw` and in every Cross Transformer run, and `patch8` keeps only the finest band (x − MA1). In those runs the decomposition branch feeds zeros and the model reads the order book only through the raw-input skip. On order book features the moving-average bands carry no useful signal at this horizon; a FI-2010 setting should drop the decomposition rather than rely on the gates to remove it.
+- Validation and test differ: validation F1 is about 0.80 and its cross-entropy 0.46, against 0.81 and 0.35 on test, because the last 20% of the training days and the test days have different class mixes (the test days are 71% stationary). Compare variants on the same split only.
+
+```bash
+python demo/run_benchmarks.py                                       # round 9
+python demo/run_benchmarks.py --datasets FI2010 --lob-horizons 10 50 100   # more horizons later
+```
+
+## Round 10: FI-2010 at longer horizons (3 seeds)
+
+Round 9 tied the best published macro F1 at k = 10, but TLOB, MLPLOB and BiN-CTABL reach 0.88 to 0.91 at k = 50 and 0.92 to 0.93 at k = 100. 30 runs, all on FI-2010:
+
+| Variant | Horizons | Question |
+|---|---|---|
+| `patch8`, `cross_gate_l0_fast` | 50, 100 | Do the k = 10 results hold at the horizons where the published models are strongest? Does exchanging information between the levels help more there? |
+| `patch8_no_ma` | 10, 50, 100 | Every band gate closed at k = 10. Is the model as good without the decomposition (one band, rank 16)? |
+| `patch8_seq336` | 10, 50, 100 | A longer input of 336 events; TLOB reads 128 and MLPLOB 384. |
+
+Results, test macro F1 (accuracy in brackets). Published rows are macro F1 from the TLOB paper (Berti et al. 2025), which retrains the older models in one framework; TLOB and MLPLOB read 144 features (40 order book + 104 handcrafted), we read the 40 order book features.
+
+| Model | k = 10 | k = 50 | k = 100 |
+|---|---|---|---|
+| *Test class shares (up / stationary / down)* | *15 / 71 / 14%* | *27 / 47 / 25%* | *34 / 35 / 31%* |
+| *DeepLOB (retrained)* | *0.711* | *0.754* | *0.776* |
+| *Axial-LOB (retrained)* | *0.732* | *0.783* | *0.792* |
+| *BiN-CTABL (retrained)* | *0.811* | *0.877* | *0.921* |
+| *TLOB (2025)* | *0.816* | *0.900* | ***0.928*** |
+| *MLPLOB (2025)* | ***0.816*** | ***0.914*** | *0.926* |
+| `patch8` | 0.811 ± 0.001 (0.876) | **0.880 ± 0.000** (0.884) | **0.927 ± 0.001** (0.926) |
+| `patch8_no_ma` | 0.811 ± 0.001 (0.878) | 0.879 ± 0.000 (0.884) | 0.925 ± 0.000 (0.925) |
+| `patch8_seq336` | **0.812 ± 0.001** (0.879) | 0.631 ± 0.423 (0.678) | 0.923 ± 0.003 (0.923) |
+| `cross_gate_l0_fast` | **0.812 ± 0.001** (0.878) | 0.879 ± 0.001 (0.883) | 0.926 ± 0.002 (0.926) |
+
+- At k = 100 the model ties the best published scores: `patch8` 0.927 against TLOB 0.928 and MLPLOB 0.926, with three times fewer input features. At k = 10 it is 0.004 behind them, within what the handcrafted features add (about 1 F1 point in the TLOB paper). At k = 50 it is clearly behind: 0.880 against MLPLOB 0.914 and TLOB 0.900, only level with BiN-CTABL (0.877). k = 50 is the horizon to work on.
+- Our four variants are tied at every horizon (within 0.002), so neither the Cross Transformer, nor the moving-average bands, nor a longer input helps on FI-2010. The edges between the levels and the decomposition can be dropped for this data; `patch8_no_ma` is the simplest setting and the most stable one (spread 0.0003 to 0.0007).
+- The band gates depend on the horizon: at k = 10 and k = 50 nearly all of them close, at k = 100 `patch8` keeps the two finest bands in every seed and `cross_gate_l0_fast` keeps three. Slower bands only matter for the longer horizon, but `patch8_no_ma` matches `patch8` there too.
+- One run failed to train: `patch8_seq336` at k = 50, seed 2021. Its training loss stayed at ln 3 = 1.0986 from the first epoch, it predicts "up" for every window (macro F1 0.142), and early stopping ended it after 5 epochs. The other two seeds give 0.876 and 0.875. Together with the `shared_patch8` seed that predicted only "stationary" in round 9, this is the second classification run that never leaves the uniform prediction. A stuck start is not caught by early stopping; the cause is not known yet (all four band gates are closed in that run, but they are in successful runs too).
+
+```bash
+python demo/run_benchmarks.py                                       # round 10
+```
+
+## Round 11: FI-2010, capacity and inputs (3 seeds)
+
+All four variants start from `patch8_no_ma` (the simplest tied setting of round 10) and run at k = 10, 50 and 100; 36 runs. The target is k = 50, where MLPLOB (0.914) and TLOB (0.900) are ahead of our 0.880.
+
+| Variant | Question |
+|---|---|
+| `no_ma_lr_low` | Learning rate 3e-4 and 20 epochs instead of 1e-3 and 10. In round 10 early stopping ended most runs, with the best validation loss at epochs 5 to 9, so more epochs alone would not help; TLOB and MLPLOB train at 1e-4 and 3e-4. |
+| `no_ma_d64`, `no_ma_e2d2` | The FI-2010 preset is small (d_model 32, one encoder and one decoder layer, about 200k parameters, most of them in the classifier head). With 200k training windows, does a wider or deeper model help, unlike on ETT? |
+| `no_ma_f144` | The 104 handcrafted features (spreads, mid-prices, differences, means, accumulated differences, derivatives, intensities) as 104 more signals. TLOB and MLPLOB read them; their paper reports about +1 F1. Nine of them are zero in every file and stay zero. |
+
+Results, test macro F1 (accuracy in brackets), published rows as in round 10. The three `no_ma_f144` runs at k = 100 first ran out of GPU memory because another process held 26 GB of the card, and were rerun; `run_benchmarks.py` now runs one job at a time by default.
+
+| Model | Params | k = 10 | k = 50 | k = 100 |
+|---|---|---|---|---|
+| *Test class shares (up / stationary / down)* | | *15 / 71 / 14%* | *27 / 47 / 25%* | *34 / 35 / 31%* |
+| *DeepLOB (retrained)* | | *0.711* | *0.754* | *0.776* |
+| *Axial-LOB (retrained)* | | *0.732* | *0.783* | *0.792* |
+| *BiN-CTABL (retrained)* | | *0.811* | *0.877* | *0.921* |
+| *TLOB (2025, 144 features)* | | *0.816* | *0.900* | *0.928* |
+| *MLPLOB (2025, 144 features)* | | *0.816* | ***0.914*** | *0.926* |
+| `patch8_no_ma` (round 10) | 200k | 0.811 ± 0.001 (0.878) | 0.879 ± 0.000 (0.884) | 0.925 ± 0.000 (0.925) |
+| `no_ma_lr_low` | 200k | 0.811 ± 0.001 (0.877) | 0.877 ± 0.001 (0.882) | 0.924 ± 0.001 (0.924) |
+| `no_ma_d64` | 792k | 0.811 ± 0.000 (0.877) | 0.878 ± 0.000 (0.883) | 0.926 ± 0.000 (0.926) |
+| `no_ma_e2d2` | 229k | 0.811 ± 0.001 (0.880) | 0.879 ± 0.000 (0.883) | 0.925 ± 0.001 (0.925) |
+| `no_ma_f144` | 626k | **0.827 ± 0.000** (0.889) | 0.912 ± 0.001 (0.916) | **0.932 ± 0.001** (0.932) |
+
+- Capacity and learning rate change nothing: a lower learning rate, four times the parameters (`no_ma_d64`) or twice the depth (`no_ma_e2d2`) stay within 0.002 of `patch8_no_ma` at every horizon. With the 40 order book features the model is limited by its input, not by its size or its optimization.
+- The 104 handcrafted features are the gap. `no_ma_f144` gains 0.016 at k = 10, 0.033 at k = 50 and 0.007 at k = 100. At k = 10 and k = 100 it is ahead of every published model (0.827 against 0.816, 0.932 against 0.928), at k = 50 it is level with MLPLOB (0.912 against 0.914) and ahead of TLOB (0.900). With the same 144 inputs as TLOB and MLPLOB the comparison is now like for like. The gain is larger than the "about +1 F1" the TLOB paper reports for these features.
+- Test cross-entropy drops even more than F1 (k = 10: 0.26 against 0.35), so the probabilities improve beyond the arg max.
+- At k = 10 all three `no_ma_f144` runs reached the 10-epoch limit; the validation loss had flattened (best at epochs 8 to 10), so a few more epochs might add a little.
+- No run got stuck at ln 3 this round.
+
+```bash
+python demo/run_benchmarks.py                                       # round 11
+```
+

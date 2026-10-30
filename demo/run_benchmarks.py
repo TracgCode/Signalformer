@@ -10,7 +10,9 @@
 Each run is a separate `train.py` process; up to --jobs (default 1) run at the same time on the same GPU, and
 each writes its output to demo/runs/benchmark/logs/. Results go to
 demo/runs/benchmark/<dataset>_<pred_len>_<variant>_s<seed>.json; finished runs are skipped on the next invocation (use
---rerun to repeat them), so an interrupted sweep resumes where it stopped.
+--rerun to repeat them), so an interrupted sweep resumes where it stopped. Runs in progress save a checkpoint to
+demo/runs/benchmark/ckpt/ every 500 steps and at the end of every epoch, so an interrupted run also resumes from its
+last checkpoint instead of from the start (--rerun deletes the checkpoints of the runs it repeats).
 
 Variants that resolve to the same configuration for a dataset (e.g. `auto_dmodel` on ETT, where 'auto' gives the
 same width as the preset) are trained once and the result is copied. Runs use torch.compile unless
@@ -148,11 +150,20 @@ VARIANTS = {
     "no_ma_d64": [*NO_MA, "--d-model", "64"],
     "no_ma_e2d2": [*NO_MA, "--encoder-layers", "2", "--decoder-layers", "2"],
     "no_ma_f144": [*NO_MA, "--lob-features", "144"],
+    # Round 12 (FI-2010): with all 144 features, longer training (every k = 10 run of round 11 reached its 10 epochs)
+    # and the extra width and depth that did not help with the 40 order book features alone
+    "f144_e20": [*NO_MA, "--lob-features", "144", "--epochs", "20"],
+    "f144_d64": [*NO_MA, "--lob-features", "144", "--d-model", "64"],
+    "f144_e2d2": [*NO_MA, "--lob-features", "144", "--encoder-layers", "2", "--decoder-layers", "2"],
+    # Round 13: the Cross Transformer with its cross-attentions in parallel, merged by one projection like the heads
+    # of multi-head attention, with and without the L0 edges (cross_gate_l0_fast is the serial counterpart)
+    "cross_par": ["--architecture", "cross", *PATCH8, "--cross-parallel"],
+    "cross_par_l0": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0"],
 }
-# Round 11: FI-2010 at horizons 10, 50 and 100. Round 10 tied the best published macro F1 at horizons 10 and 100
-# but not at 50; these variants look for the missing capacity or inputs. Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
+# Round 13: the parallel Cross Transformer on ETTm1, ETTm2 and Weather (horizon 96) and on FI-2010 with the 40 order
+# book features (horizons 10, 50 and 100), against the serial cross_gate_l0_fast of rounds 9 and 10. Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
 # they only helped at input 336 on two datasets, within noise.
-DEFAULT_VARIANTS = ["no_ma_lr_low", "no_ma_d64", "no_ma_e2d2", "no_ma_f144"]
+DEFAULT_VARIANTS = ["cross_par", "cross_par_l0"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 # Variants that only run on some datasets (others show "–" in the summary)
 VARIANT_DATASETS = {
@@ -178,6 +189,11 @@ VARIANT_DATASETS = {
     "no_ma_d64": ("FI2010",),
     "no_ma_e2d2": ("FI2010",),
     "no_ma_f144": ("FI2010",),
+    "f144_e20": ("FI2010",),
+    "f144_d64": ("FI2010",),
+    "f144_e2d2": ("FI2010",),
+    "cross_par": CROSS_DATASETS,
+    "cross_par_l0": CROSS_DATASETS,
     # Width and depth on the small presets; Traffic already uses d_model 64 and two encoder layers
     "patch8_d64": ("ETTm1", "ETTm2", "Weather"),
     "patch8_e2d2": ("ETTm1", "ETTm2", "Weather"),
@@ -245,6 +261,11 @@ class Job:
     @property
     def output(self) -> Path:
         return result_path(self.dataset, self.pred_len, self.variant, self.seed)
+
+    @property
+    def checkpoint(self) -> Path:
+        # train.py's default for this --output; an interrupted run resumes from it
+        return self.output.parent / "ckpt" / f"{self.output.stem}.pt"
 
     def command(self, compile_model: bool) -> list[str]:
         cmd = [sys.executable, "-u", str(DEMO_DIR / "train.py"), *self.train_argv, "--tag", self.variant]
@@ -429,7 +450,10 @@ def main() -> None:
     while pending or running:
         while pending and len(running) < args.jobs:
             job = pending.popleft()
-            log = open(log_dir / f"{job.name}.log", "w")
+            if args.rerun:
+                job.checkpoint.unlink(missing_ok=True)
+            # a resumed run appends to the log of its interrupted attempt
+            log = open(log_dir / f"{job.name}.log", "a" if job.checkpoint.exists() else "w")
             process = subprocess.Popen(job.command(not args.no_compile), stdout=log, stderr=subprocess.STDOUT)
             running[process] = (job, log, time.time())
             print(f"start  {job.name}", flush=True)

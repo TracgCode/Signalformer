@@ -29,7 +29,7 @@ Weather and Traffic are fetched from the Autoformer benchmark archive mirrored b
 - No calendar features by default. Enable them with `--time-features` (any of `hour,dow,doy`). With RevIN they did not help on these benchmarks, and day of year acts as a date ID the model memorizes on datasets spanning one or two years.
 - Reversible instance normalization (RevIN) is on by default; disable with `--no-revin`.
 
-FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3 days test, and the last 20% of every stock's training events validate. The inputs are the 40 order book features (ask / bid price and volume of the 10 best levels), or with `--lob-features 144` also the dataset's 104 handcrafted features, z-scored again with training statistics; no window crosses a stock boundary. The label of a window is the mid-price move (up / stationary / down) of its last event over the next `--pred-len` events (10, 20, 30, 50 or 100). The model averages its decoder features over the decoder steps, concatenates them over the signals and classifies with an FFN head; it trains with cross-entropy, stops early on validation cross-entropy and reports macro F1 and accuracy. The test set is 71% stationary at horizon 10, so accuracy alone is misleading; DeepLOB reports accuracy 84.5% and F1 83.4% at k = 10 in Setup 2, with precision, recall and F1 weighted by class support; the benchmark summary prints macro F1, and EXPERIMENTS.md also gives weighted F1 for that comparison.
+FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3 days test, and the last 20% of every stock's training events validate. The inputs are the 40 order book features (ask / bid price and volume of the 10 best levels), or with `--lob-features 144` also the dataset's 104 handcrafted features, z-scored again with training statistics; no window crosses a stock boundary. The label of a window is the mid-price move (up / stationary / down) of its last event over the next `--pred-len` events (10, 20, 30, 50 or 100). The model averages its decoder features over the decoder steps, concatenates them over the signals and classifies with an FFN head; it trains with cross-entropy (with a linear learning-rate warmup over the first 1% of steps, `--warmup`), stops early on validation cross-entropy and reports macro F1 and accuracy. The test set is 71% stationary at horizon 10, so accuracy alone is misleading; DeepLOB reports accuracy 84.5% and F1 83.4% at k = 10 in Setup 2, with precision, recall and F1 weighted by class support; the benchmark summary prints macro F1, and EXPERIMENTS.md also gives weighted F1 for that comparison.
 
 ## Benchmark sweep
 
@@ -37,12 +37,13 @@ FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3
 
 - Up to `--jobs` runs (default 1) share the GPU; each writes its log to `demo/runs/benchmark/logs/`. Without NVIDIA MPS the processes are time-sliced, so the gain comes from filling each other's idle GPU time.
 - Runs use `torch.compile` unless `--no-compile` is given.
-- Finished runs are skipped on the next call (`--rerun` repeats them), so an interrupted sweep resumes where it stopped.
+- Finished runs are skipped on the next call (`--rerun` repeats them), so an interrupted sweep resumes where it stopped. A run in progress saves its full training state to `demo/runs/benchmark/ckpt/` every 500 steps (`--ckpt-every`) and at the end of every epoch, resumes from it when it is started again and deletes it once its result is saved; `--rerun` starts from scratch.
+- Every run logs the training loss, gradient norm and learning rate every 200 steps (`--log-every`), and on FI-2010 the spread of the logits over the batch, flagged `STUCK` when the predictions no longer depend on the input.
 - Variants that resolve to the same configuration for a dataset are trained once and the result is copied.
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py                                  # round 11: FI-2010 at horizons 10, 50 and 100, 3 seeds
+python demo/run_benchmarks.py                                  # round 13: parallel Cross Transformer on ETTm1, ETTm2, Weather and FI-2010, 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
@@ -52,7 +53,22 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 
 The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-Round 11, the default sweep (FI-2010 only, at horizons 10, 50 and 100; all four start from `patch8_no_ma`):
+Round 13, the default sweep (ETTm1, ETTm2 and Weather at horizon 96, FI-2010 with the 40 order book features at horizons 10, 50 and 100):
+
+| Variant | Change from `cross_patch8` |
+|---|---|
+| `cross_par` | `--cross-parallel`: the cross-attentions to all signals run in parallel with the same queries, each source signal with its own softmax, and are merged by one concatenation and a C * D -> D projection, like the heads of multi-head attention, then the FFN |
+| `cross_par_l0` | `cross_par` with the L0 edge masks of `cross_gate_l0_fast` (masks at `--gate-lr`) |
+
+Round 12 (FI-2010 only, at horizons 10, 50 and 100; all three start from `no_ma_f144`):
+
+| Variant | Change from `no_ma_f144` |
+|---|---|
+| `f144_e20` | 20 epochs instead of 10 (early stopping still applies) |
+| `f144_d64` | d_model 64 instead of 32 |
+| `f144_e2d2` | two encoder and two decoder layers |
+
+Round 11 (FI-2010 only, at horizons 10, 50 and 100; all four start from `patch8_no_ma`):
 
 | Variant | Change from `patch8_no_ma` |
 |---|---|

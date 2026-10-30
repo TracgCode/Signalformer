@@ -374,3 +374,73 @@ Results, test macro F1 (accuracy in brackets), published rows as in round 10. Th
 python demo/run_benchmarks.py                                       # round 11
 ```
 
+## Round 12: FI-2010, training length and size with all 144 features (3 seeds)
+
+Round 11 showed that the gap to TLOB and MLPLOB came from the inputs: with the 40 order book features, neither a lower learning rate, nor a wider or deeper model helped, while the 104 handcrafted features added 0.016 / 0.033 / 0.007 macro F1. With 144 signals the model has more to fit, so the round 11 capacity questions are asked again. All three variants start from `no_ma_f144` (round 11 gives its results) and run at k = 10, 50 and 100; 27 runs, one at a time.
+
+| Variant | Question |
+|---|---|
+| `f144_e20` | Every k = 10 run of `no_ma_f144` reached its 10 epochs with the validation loss still close to its best. Do 20 epochs (the cosine schedule stretches with them) add anything? |
+| `f144_d64`, `f144_e2d2` | Does a wider or deeper model help once the input carries more information? Most of all at k = 50, where MLPLOB is still 0.002 ahead. |
+
+The Cross Transformer is left out: its cost grows with the square of the number of signals, and at 144 signals one epoch would take about 13 times the 215 s it took with 40.
+
+First run (2026-10-28), not used for conclusions:
+- Four of the six `f144_d64` and `f144_e2d2` runs at k = 50 got stuck at the uniform prediction (training loss ln 3 = 1.0986 from the first epoch, macro F1 0.13 to 0.14), and all six at k = 100 ran out of GPU memory because another process held 26 GB of the card.
+- The completed runs: `f144_e20` 0.822 / 0.909 / 0.931 (k = 10 / 50 / 100), below `no_ma_f144`. It stops early after 10 or 11 epochs anyway, while the cosine schedule, stretched to 20 epochs, has not decayed by then. `f144_d64` 0.828 at k = 10; `f144_e2d2` 0.825.
+
+The stuck runs, explained: the classifier head reads the concatenated features of all signals (144 x 64 = 9216 inputs with `f144_d64`). The first AdamW step moves every weight by about the full learning rate, so the pre-activations of the head's hidden layer shift by several units at once. Traced on CPU for `f144_d64`, k = 50, seed 2021:
+- At step 1 the loss jumped from 1.12 to 17.3 and 42% of the hidden units were below zero for the whole batch. By step 70 all of them were.
+- The logits then no longer depend on the input (spread over the batch 0.0003) and no gradient reaches the model.
+- A wider head (more signals, larger d_model) makes this likelier, which is why `seq336`, `shared_patch8` and now `d64` / `e2d2` with 144 features were hit, and why forecasting runs never were.
+- With a linear warmup over the first 300 steps no unit died and the logit spread grew normally.
+
+Fix: `train.py --warmup` (linear warmup over a fraction of all steps, then the cosine decay), 0.01 by default on FI-2010 and 0 elsewhere, so forecasting runs are unchanged. `train.py` now also logs the training loss, gradient norm, learning rate and, on FI-2010, the logit spread every `--log-every` steps (and every step of the first 10), flagging `STUCK` when the spread falls below 1e-3. Round 12 is rerun in full with the warmup (`--rerun`).
+
+Results of the rerun with the warmup, test macro F1 (accuracy in brackets). No run got stuck: the smallest logit spread logged in the 27 runs was 0.07, far above the `STUCK` threshold of 1e-3. `no_ma_f144` is from round 11, without the warmup.
+
+| Model | Params | k = 10 | k = 50 | k = 100 |
+|---|---|---|---|---|
+| *Test class shares (up / stationary / down)* | | *15 / 71 / 14%* | *27 / 47 / 25%* | *34 / 35 / 31%* |
+| *DeepLOB (retrained)* | | *0.711* | *0.754* | *0.776* |
+| *BiN-CTABL (retrained)* | | *0.811* | *0.877* | *0.921* |
+| *TLOB (2025, 144 features)* | | *0.816* | *0.900* | *0.928* |
+| *MLPLOB (2025, 144 features)* | | *0.816* | ***0.914*** | *0.926* |
+| `no_ma_f144` (round 11) | 626k | **0.827 ± 0.000** (0.889) | 0.912 ± 0.001 (0.916) | **0.932 ± 0.001** (0.932) |
+| `f144_e20` | 626k | 0.823 ± 0.002 (0.887) | 0.911 ± 0.000 (0.915) | 0.931 ± 0.001 (0.931) |
+| `f144_d64` | 2.5M | 0.825 ± 0.004 (0.889) | 0.912 ± 0.001 (0.916) | **0.932 ± 0.001** (0.932) |
+| `f144_e2d2` | 655k | 0.826 ± 0.001 (0.889) | ***0.914 ± 0.001*** (0.918) | **0.932 ± 0.001** (0.932) |
+
+- With the warmup every run trains: the 4 stuck runs of the first attempt are gone, and the step logs never came near the threshold.
+- Neither training length nor model size helps with 144 features either. All four settings are within 0.004 of each other at every horizon, about the size of the seed spread. `f144_e2d2` is the only one level with MLPLOB at k = 50 (0.914), by 0.002 over `no_ma_f144`, which is within noise.
+- `f144_e20` again stops early after 8 to 11 epochs; with the longer cosine schedule the learning rate is still high when it stops, and it ends slightly lower than the 10-epoch runs.
+- Overall the model now matches or beats the published FI-2010 results at all three horizons with the same 144 inputs (k = 10: 0.827 vs 0.816, k = 50: 0.912 to 0.914 vs 0.914, k = 100: 0.932 vs 0.928), at 0.6M parameters. `no_ma_f144` stays the FI-2010 default: the smallest of the tied settings.
+
+```bash
+python demo/run_benchmarks.py --rerun                               # round 12, with the warmup
+```
+
+## Round 13 (prepared, not run yet): the parallel Cross Transformer
+
+The serial Cross Transformer reads the C signals one after another: for j = 1 .. C every signal's decoder cross-attends to signal j's memory and adds the result before it reads signal j + 1. The result depends on the order of the signals in the dataset, and the keys and values of every signal are projected C times. It tied channel independence on FI-2010 (rounds 9 and 10) at about ten times the cost.
+
+`--cross-parallel` (`SignalParallelCrossBlock`) reads all signals at once, merged like the heads of multi-head attention:
+- every receiving signal's decoder cross-attends to every signal's memory with the same queries (the block input after self-attention), each source signal with its own softmax;
+- the C outputs are concatenated and merged by one C * D -> D projection, so each source signal has its own slice of the output projection, then the FFN;
+- the edge gates and L0 masks scale each source's output before the concatenation, as in the serial block;
+- keys and values are projected once per signal, and all C x C attentions run as one batched call. On CPU one block is 1.8 to 2.5 times faster than the serial one (C = 7 to 40); the projection adds C * D * D weights per layer (about 40k at C = 40, D = 32).
+
+A comparison against an explicit loop over all (receiver, source) pairs agrees to 5e-7, with and without gates.
+
+36 runs, 3 seeds:
+
+| Variant | Datasets | Question |
+|---|---|---|
+| `cross_par` | ETTm1, ETTm2, Weather (96); FI-2010, 40 features (k = 10, 50, 100) | Does exchanging information between the signals help once it is read in parallel and merged by a learned projection? |
+| `cross_par_l0` | same | The same with the L0 edges; against the serial `cross_gate_l0_fast` of rounds 9 and 10. |
+
+On FI-2010 the new runs use the warmup of round 12; the serial runs of rounds 9 and 10 did not, but none of them got stuck. ETT and Weather are unaffected (no warmup there).
+
+```bash
+python demo/run_benchmarks.py                                       # round 13
+```

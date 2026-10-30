@@ -19,6 +19,7 @@ then scored on the full validation and test splits, keeping every window (no dro
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections.abc import Iterator
@@ -60,7 +61,7 @@ PRESETS = {
 CI_PRESETS = {"Traffic": dict(batch_size=4)}
 
 # Arguments that do not change what is trained (used to detect duplicate configurations)
-NON_CONFIG_ARGS = {"tag", "output", "device", "compile"}
+NON_CONFIG_ARGS = {"tag", "output", "device", "compile", "log_every", "checkpoint", "ckpt_every"}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -110,6 +111,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # tree: tree-merging architecture (tree_model.py); cross: Cross Transformer, channel-independent encoders and
     # a decoder in which every signal cross-attends to every signal's memory in signal order
     p.add_argument("--architecture", choices=("signalformer", "tree", "cross"), default="signalformer")
+    p.add_argument("--cross-parallel", action="store_true",
+                   help="cross architecture: run the cross-attentions to all signals in parallel and merge them with "
+                   "one projection, like the heads of multi-head attention, instead of one after another")
     p.add_argument("--edge-gates", nargs="?", const="l1", choices=("l1", "l0"),
                    help="cross architecture: learnable gate per (receiving, sending) signal pair, starting as the "
                    "identity (plain channel independence); l1 (the default) penalizes the gate values, l0 adds a "
@@ -144,6 +148,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--muon-momentum", type=float, default=0.95)
     p.add_argument("--scheduler", choices=("cosine", "onecycle"), default="cosine",
                    help="cosine decays from the start; onecycle warms up for the first 10%% of steps")
+    p.add_argument("--warmup", type=float,
+                   help="cosine scheduler: linear warmup over this fraction of all steps (default 0.01 for FI2010, "
+                   "0 otherwise). Without it the first full-size Adam step can push every hidden unit of the wide "
+                   "classifier head below zero, and the run never leaves the uniform prediction (loss ln 3)")
+    p.add_argument("--log-every", type=int, default=200,
+                   help="print the training loss, gradient norm and learning rate every this many steps (and every "
+                   "step of the first 10); 0 = once per epoch only")
     p.add_argument("--patience", type=int, default=3,
                    help="early stopping on validation MSE (cross-entropy for FI2010)")
     p.add_argument("--val-windows", type=int, default=2048,
@@ -155,6 +166,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--compile", action="store_true", help="torch.compile the model (CUDA only)")
     p.add_argument("--tag", default="", help="label stored in the result file and its name")
     p.add_argument("--output", type=Path, help="result JSON path (default: demo/runs/<dataset>_<pred_len>_...)")
+    p.add_argument("--checkpoint", type=Path,
+                   help="training state saved every --ckpt-every steps and at the end of every epoch; a run started "
+                   "again with the same file resumes from it, and it is deleted once the result is saved (default: "
+                   "ckpt/<output name>.pt next to --output, none without --output)")
+    p.add_argument("--ckpt-every", type=int, default=500, help="steps between checkpoints (0 = end of epoch only)")
     args = p.parse_args(argv)
     args.channel_independent = not args.shared
     if args.ci_latents != "0" and args.shared:
@@ -164,6 +180,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "and --raw-tokens")
     if args.architecture == "cross" and (args.shared or args.ci_latents != "0" or args.freq_tokens):
         p.error("the cross architecture is channel-independent and supports neither --ci-latents nor --freq-tokens")
+    if args.cross_parallel and args.architecture != "cross":
+        p.error("--cross-parallel requires --architecture cross")
     if args.edge_gates and args.architecture != "cross":
         p.error("--edge-gates requires --architecture cross")
     if args.dataset in LOB_DATASETS:
@@ -179,6 +197,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.edge_lambda = 1e-2 if args.edge_gates == "l0" else 1e-3
     if args.edge_mask_lr is None:
         args.edge_mask_lr = args.gate_lr
+    if args.warmup is None:
+        args.warmup = 0.01 if args.dataset in LOB_DATASETS else 0.0
+    if args.warmup and args.scheduler != "cosine":
+        p.error("--warmup applies to the cosine scheduler; onecycle has its own warmup")
     if args.time_features == "none":
         args.time_fields = ()
     else:
@@ -260,18 +282,28 @@ class DeviceWindows:
         return x, y, times[:, : self.seq_len], times[:, self.seq_len :]
 
     def batches(
-        self, batch_size: int, shuffle: bool = False, drop_last: bool = False, subset: int = 0
+        self,
+        batch_size: int,
+        shuffle: bool = False,
+        drop_last: bool = False,
+        subset: int = 0,
+        order: torch.Tensor | None = None,
+        start: int = 0,
     ) -> Iterator[tuple]:
+        # order: a given window order (e.g. the shuffle of a resumed epoch); start: index of the first batch
+        if order is None:
+            order = self.window_order(shuffle, subset)
+        stop = len(order) - len(order) % batch_size if drop_last else len(order)
+        for i in range(start * batch_size, stop, batch_size):
+            yield self.batch(order[i : i + batch_size])
+
+    def window_order(self, shuffle: bool = False, subset: int = 0) -> torch.Tensor:
         if subset and subset < self.num_windows:
             # Fixed, evenly spaced windows so every epoch is scored on the same subset
-            order = torch.linspace(0, self.num_windows - 1, subset, device=self.device).long()
-        elif shuffle:
-            order = torch.randperm(self.num_windows, device=self.device)
-        else:
-            order = torch.arange(self.num_windows, device=self.device)
-        stop = len(order) - len(order) % batch_size if drop_last else len(order)
-        for i in range(0, stop, batch_size):
-            yield self.batch(order[i : i + batch_size])
+            return torch.linspace(0, self.num_windows - 1, subset, device=self.device).long()
+        if shuffle:
+            return torch.randperm(self.num_windows, device=self.device)
+        return torch.arange(self.num_windows, device=self.device)
 
     def num_batches(self, batch_size: int, drop_last: bool = False) -> int:
         return self.num_windows // batch_size if drop_last else -(-self.num_windows // batch_size)
@@ -406,6 +438,7 @@ def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.
         freq_tokens=args.freq_tokens,
         raw_tokens=args.raw_tokens,
         cross_decoder=args.architecture == "cross",
+        cross_parallel=args.cross_parallel,
         edge_gates=args.edge_gates,
         num_classes=num_classes,
     )
@@ -458,7 +491,12 @@ def main() -> None:
                 optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=0.1
             ))
         else:
-            schedulers.append(torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps))
+            warmup_steps = round(args.warmup * total_steps)
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
+            if warmup_steps > 0:
+                warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-3, total_iters=warmup_steps)
+                cosine = torch.optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [warmup_steps])
+            schedulers.append(cosine)
     if len(optimizers) > 1:
         print(f"muon: {sum(p.numel() for p in optimizers[1].param_groups[0]['params']):,} parameters")
     # bf16 autocast on GPUs that support it; no GradScaler needed
@@ -467,12 +505,60 @@ def main() -> None:
     def autocast():
         return torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16)
 
-    best_val, best_state, bad_epochs, history = math.inf, None, 0, []
-    for epoch in range(1, args.epochs + 1):
+    best_val, best_state, bad_epochs, history, step_log = math.inf, None, 0, [], []
+    tag = f"_{args.tag}" if args.tag else ""
+    out = args.output or RUNS_DIR / f"{args.dataset}_{args.pred_len}{tag}_{time.strftime('%Y%m%d-%H%M%S')}.json"
+    checkpoint = args.checkpoint or (args.output.parent / "ckpt" / f"{args.output.stem}.pt" if args.output else None)
+    config = effective_config(args, num_signals)
+
+    def save_checkpoint(epoch: int, step: int, order: torch.Tensor | None, total: float) -> None:
+        # epoch / step: where training continues; order: that epoch's window order (None: a new epoch)
+        state = dict(
+            config=config, epoch=epoch, step=step, order=None if order is None else order.cpu(), total=total,
+            model=model.state_dict(), optimizers=[o.state_dict() for o in optimizers],
+            schedulers=[s.state_dict() for s in schedulers], best_val=best_val, best_state=best_state,
+            bad_epochs=bad_epochs, history=history, step_log=step_log, rng=torch.get_rng_state(),
+            cuda_rng=torch.cuda.get_rng_state_all() if args.device == "cuda" else None,
+        )
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        partial = checkpoint.with_suffix(".partial")
+        torch.save(state, partial)
+        os.replace(partial, checkpoint)  # atomic: an interrupted save never leaves a broken checkpoint
+
+    first_epoch, first_step, resumed_order, resumed_total = 1, 0, None, 0.0
+    if checkpoint is not None and checkpoint.exists():
+        state = torch.load(checkpoint, map_location=args.device, weights_only=False)
+        if state["config"] != config:
+            print(f"warning: {checkpoint} was saved with other settings; starting from scratch")
+        else:
+            model.load_state_dict(state["model"])
+            for optimizer, saved in zip(optimizers, state["optimizers"]):
+                optimizer.load_state_dict(saved)
+            for scheduler, saved in zip(schedulers, state["schedulers"]):
+                scheduler.load_state_dict(saved)
+            best_val, best_state, bad_epochs = state["best_val"], state["best_state"], state["bad_epochs"]
+            history, step_log = state["history"], state["step_log"]
+            torch.set_rng_state(state["rng"])
+            if state["cuda_rng"] is not None:
+                torch.cuda.set_rng_state_all(state["cuda_rng"])
+            first_epoch, first_step, resumed_total = state["epoch"], state["step"], state["total"]
+            if state["order"] is not None:
+                resumed_order = state["order"].to(args.device)
+            print(f"resumed from {checkpoint} at epoch {first_epoch}, step {first_step}")
+
+    for epoch in range(first_epoch, args.epochs + 1):
+        if bad_epochs >= args.patience:
+            break  # the checkpoint was saved right before early stopping
         model.train()
         start = time.time()
-        total = torch.zeros((), device=args.device)
-        for step, (x, y, t_in, t_out) in enumerate(train.batches(args.batch_size, shuffle=True, drop_last=True)):
+        if resumed_order is not None:
+            order, first, total = resumed_order, first_step, torch.tensor(resumed_total, device=args.device)
+            resumed_order = None
+        else:
+            order, first, total = train.window_order(shuffle=True), 0, torch.zeros((), device=args.device)
+        interval, interval_steps = torch.zeros((), device=args.device), 0
+        batches = train.batches(args.batch_size, drop_last=True, order=order, start=first)
+        for step, (x, y, t_in, t_out) in enumerate(batches, start=first):
             if step >= steps_per_epoch:
                 break
             for optimizer in optimizers:
@@ -501,11 +587,31 @@ def main() -> None:
                 baseline = (b.sum() - b) / max(1, b.numel() - 1)
                 loss = loss + ((b - baseline) * tree_model.last_log_prob).mean()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            lr = optimizers[0].param_groups[0]["lr"]
             for optimizer, scheduler in zip(optimizers, schedulers):
                 optimizer.step()
                 scheduler.step()
             total += task_loss.detach()  # summed on the device to avoid a host sync every step
+            interval += task_loss.detach()
+            interval_steps += 1
+            if args.log_every and (global_step < 10 or (global_step + 1) % args.log_every == 0):
+                entry = dict(step=global_step + 1, loss=interval.item() / interval_steps,
+                             grad_norm=grad_norm.item(), lr=lr)
+                line = (f"step {global_step + 1:6d}/{total_steps}  train {entry['loss']:.4f}  "
+                        f"grad {entry['grad_norm']:.3g}  lr {lr:.2e}")
+                if classify:
+                    # spread of the logits over the batch: near 0 the predictions no longer depend on the input
+                    # (e.g. every hidden unit of the classifier head is below zero) and the run is stuck
+                    entry["logit_spread"] = pred.detach().float().std(dim=0).mean().item()
+                    line += f"  logit spread {entry['logit_spread']:.3g}"
+                    if entry["logit_spread"] < 1e-3:
+                        line += "  STUCK: predictions do not depend on the input"
+                step_log.append(entry)
+                print(line, flush=True)
+                interval, interval_steps = torch.zeros((), device=args.device), 0
+            if checkpoint is not None and args.ckpt_every and (step + 1) % args.ckpt_every == 0 and step + 1 < steps_per_epoch:
+                save_checkpoint(epoch, step + 1, order, total.item())
         train_loss = total.item() / steps_per_epoch
         val_metrics = evaluate(forward, model, val, args.batch_size, autocast, args.val_windows, args.max_steps)
         val_metrics.pop("confusion", None)
@@ -525,9 +631,11 @@ def main() -> None:
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad_epochs += 1
-            if bad_epochs >= args.patience:
-                print("early stopping")
-                break
+        if checkpoint is not None:
+            save_checkpoint(epoch + 1, 0, None, 0.0)
+        if bad_epochs >= args.patience:
+            print("early stopping")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -537,8 +645,6 @@ def main() -> None:
     print(f"val   {describe(val_metrics)}  (full split)")
     print(f"test  {describe(test_metrics)}")
 
-    tag = f"_{args.tag}" if args.tag else ""
-    out = args.output or RUNS_DIR / f"{args.dataset}_{args.pred_len}{tag}_{time.strftime('%Y%m%d-%H%M%S')}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     model.eval()
     out.write_text(json.dumps(dict(
@@ -546,11 +652,13 @@ def main() -> None:
         num_params=num_params,
         **{f"val_{k}": v for k, v in val_metrics.items() if k != "loss"},
         **{f"test_{k}": v for k, v in test_metrics.items() if k != "loss"},
-        history=history, gate_values=gate.gate_values().tolist() if gate else [],
+        history=history, steps=step_log, gate_values=gate.gate_values().tolist() if gate else [],
         tree=tree_model.tree if tree_model is not None else None,
         edge_gates=[w.tolist() for w in model.edge_weights()] if args.edge_gates else None,
     ), indent=2))
     print(f"saved {out}")
+    if checkpoint is not None:
+        checkpoint.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

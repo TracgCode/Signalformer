@@ -78,6 +78,9 @@ class Signalformer(nn.Module):
     L1 penalty; edge_gates="l0" adds a Hard Concrete mask to every cross-signal edge, with an L0 penalty that can
     close edges exactly (see SignalCrossBlock). Add lam * model.edge_penalty() to the loss to keep the
     cross-signal edges sparse.
+    cross_parallel=True runs the C cross-attentions of each decoder layer in parallel instead of in signal order
+    and merges them like the heads of multi-head attention: one concatenation and one C * D -> D output projection
+    (see SignalParallelCrossBlock). The result does not depend on the order of the signals.
 
     output_signals sets the number of forecast signals after the output projection, which maps the C
     per-signal forecasts of every step to output_signals values (with channel_independent=True). 0 or C keeps
@@ -122,6 +125,7 @@ class Signalformer(nn.Module):
         freq_tokens: bool = False,
         raw_tokens: bool = False,
         cross_decoder: bool = False,
+        cross_parallel: bool = False,
         edge_gates: bool | str = False,
         output_signals: int = 0,
         num_classes: int = 0,
@@ -137,6 +141,7 @@ class Signalformer(nn.Module):
         edge_gates = "l1" if edge_gates is True else (edge_gates or "")
         assert edge_gates in ("", "l1", "l0"), "edge_gates must be False, True, 'l1' or 'l0'"
         assert not edge_gates or cross_decoder, "edge_gates requires cross_decoder=True"
+        assert not cross_parallel or cross_decoder, "cross_parallel requires cross_decoder=True"
         assert output_signals in (0, in_channels) or channel_independent, "output_signals requires channel_independent"
         assert num_classes == 0 or output_signals in (0, in_channels), "num_classes replaces the output projection"
         if num_classes > 0:
@@ -195,6 +200,7 @@ class Signalformer(nn.Module):
             freq_tokens=freq_tokens,
             raw_tokens=raw_tokens,
             cross_signals=num_signals if cross_decoder else 0,
+            cross_parallel=cross_parallel,
             edge_gates=edge_gates,
         )
         # The frequency and raw tokens describe the signals the tokenizer sees (one signal with channel independence)
@@ -478,6 +484,7 @@ class SignalDecoder(nn.Module):
         freq_tokens: bool = False,
         raw_tokens: bool = False,
         cross_signals: int = 0,
+        cross_parallel: bool = False,
         edge_gates: str = "",
     ) -> None:
         super().__init__()
@@ -486,8 +493,19 @@ class SignalDecoder(nn.Module):
         self.queries = nn.Parameter(torch.randn(output_length * samples_per_output, d_model) * 0.02)
         # cross_signals = C > 0: Cross Transformer decoder, a complete graph over C channel-independent signals
         self.cross_signals = cross_signals
+        # cross_parallel: the C cross-attentions run in parallel and are merged by one projection
         self.blocks = nn.ModuleList(
-            SignalCrossBlock(
+            SignalParallelCrossBlock(
+                d_model,
+                num_heads,
+                cross_signals,
+                dropout,
+                raw_tokens=raw_tokens,
+                edge_gate_signals=cross_signals if edge_gates else 0,
+                edge_l0=edge_gates == "l0",
+            )
+            if cross_signals > 0 and cross_parallel
+            else SignalCrossBlock(
                 d_model,
                 num_heads,
                 dropout,
@@ -1118,6 +1136,82 @@ class SignalCrossBlock(nn.Module):
         if self.edge_mask is None:
             return self.edge_gate.masked_select(~eye).abs().mean()
         return self.edge_mask.open_probability().view_as(self.edge_gate).masked_select(~eye).mean()
+
+
+class SignalParallelCrossBlock(SignalCrossBlock):
+    """SignalCrossBlock with the C cross-attentions in parallel instead of in signal order, merged like the heads
+    of multi-head attention: causal self-attention -> [raw cross-attention] -> C parallel cross-attentions ->
+    concatenation -> one output projection -> FFN.
+
+    - Every signal's decoder cross-attends to every signal's memory with the same queries (the block input after
+      self-attention), so the result does not depend on the order of the signals.
+    - Each source signal j is one "head group": its attention has its own softmax, and its output gets its own
+      slice of the output projection (C * D -> D), as the heads of multi-head attention do.
+    - The queries, keys and values are projected once (keys and values once per signal, not once per pair), and
+      all C x C attentions run as one batched call, (N, C, C, H, L, D / H).
+    - Edge gates and L0 masks work as in SignalCrossBlock: g[i, j] scales the output of source j for receiver i
+      before the concatenation. Without gates every source enters the projection unscaled.
+    - The projection has C * D * D weights per block, so this suits tens of signals, not hundreds.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        num_signals: int,
+        dropout: float = 0.1,
+        raw_tokens: bool = False,
+        edge_gate_signals: int = 0,
+        edge_l0: bool = False,
+    ) -> None:
+        super().__init__(d_model, num_heads, dropout, raw_tokens, edge_gate_signals, edge_l0)
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        del self.cross_attn  # replaced by the parallel projections below
+        self.num_heads = num_heads
+        self.num_signals = num_signals
+        self.attn_dropout = dropout
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model)
+        self.out_proj = nn.Linear(num_signals * d_model, d_model)
+        self.rope = RotaryEmbedding(d_model // num_heads)
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        memory: torch.Tensor,
+        offset: int = 0,
+        memory_offset: int = 0,
+        memory_stride: int = 1,
+        raw_memory: torch.Tensor | None = None,
+        **_: object,
+    ) -> torch.Tensor:
+        # input: (N * C, L, D), memory: (N, C, T, D), raw_memory: (N * C, L_in, D)
+        x = input + self.dropout(self.self_attn(self.self_attn_norm(input), offset))
+        if self.raw_attn is not None and raw_memory is not None:
+            x = x + self.dropout(
+                self.raw_attn(self.raw_attn_norm(x), self.raw_memory_norm(raw_memory), query_offset=offset)
+            )
+        n, num_signals, length, d = memory.shape
+        assert num_signals == self.num_signals, "the output projection was built for a different number of signals"
+        h, l_q = self.num_heads, x.size(1)
+        q = self.q_proj(self.cross_attn_norm(x)).view(n, num_signals, l_q, h, -1).transpose(2, 3)  # (N, C, H, L, D/H)
+        k, v = self.kv_proj(self.memory_norm(memory)).chunk(2, dim=-1)
+        k, v = (t.view(n, num_signals, length, h, -1).transpose(2, 3) for t in (k, v))  # (N, C, H, T, D/H)
+        q, k = self.rope(q, offset), self.rope(k, memory_offset, memory_stride)
+        # receiver i on dim 1, source j on dim 2
+        y = F.scaled_dot_product_attention(
+            q.unsqueeze(2).expand(-1, -1, num_signals, -1, -1, -1),
+            k.unsqueeze(1).expand(-1, num_signals, -1, -1, -1, -1),
+            v.unsqueeze(1).expand(-1, num_signals, -1, -1, -1, -1),
+            dropout_p=self.attn_dropout if self.training else 0.0,
+        )  # (N, C, C, H, L, D/H)
+        if self.edge_gate is not None:
+            assert self.edge_gate.size(0) == num_signals, "edge gates were built for a different number of signals"
+            y = y * self.edge_weights().view(1, num_signals, num_signals, 1, 1, 1)
+        # (N, C_i, L, C_j, H, D/H) -> (N * C, L, C * D): source-major concatenation, heads inside each source
+        y = y.permute(0, 1, 4, 2, 3, 5).reshape(n * num_signals, l_q, num_signals * d)
+        x = x + self.dropout(self.out_proj(y))
+        return x + self.dropout(self.ffn(self.ffn_norm(x)))
 
 
 class SelfTransformerBlock(nn.Module):

@@ -43,7 +43,7 @@ FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 14: longer horizons, 3 seeds
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 15: learnable cycle, 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
@@ -53,7 +53,15 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 
 The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-Round 14, the default variants (`patch8`, `cross_gate_l0_fast`, `cross_par_l0`) on ETTm1, ETTm2 and Weather at horizons 192, 336 and 720; no new variants.
+Round 15, the default sweep (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+
+| Variant | Change |
+|---|---|
+| `patch8_cycle` | `patch8` with `--cycle-len daily`: residual cycle forecasting with a learnable cycle of one day per signal (96 steps on ETTm, 144 on Weather), indexed by the absolute time step; the model forecasts the normalized window minus the cycle, and the cycle is added back |
+| `cross_par_l0_cycle` | `cross_par_l0` with `--cycle-len daily` |
+| `cross_par_l0_drop` | `cross_par_l0` with dropout 0.3 instead of 0.2 |
+
+Round 14: the variants (`patch8`, `cross_gate_l0_fast`, `cross_par_l0`) on ETTm1, ETTm2 and Weather at horizons 192, 336 and 720; no new variants.
 
 Round 13 (ETTm1, ETTm2 and Weather at horizon 96, FI-2010 with the 40 order book features at horizons 10, 50 and 100):
 

@@ -57,6 +57,8 @@ PRESETS = {
     # 40 order book features; with channel independence a batch of 64 windows is 2560 sequences
     "FI2010": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=64, lr=1e-3),
 }
+# Steps per day, the period of --cycle-len daily
+DAILY_STEPS = {"ETTm1": 96, "ETTm2": 96, "Weather": 144, "Traffic": 24}
 # Channel independence (the default) runs every signal as its own sequence: Traffic needs smaller batches
 CI_PRESETS = {"Traffic": dict(batch_size=4)}
 
@@ -122,6 +124,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="weight of the edge penalty (default 1e-3 for l1, 1e-2 for l0)")
     p.add_argument("--edge-mask-lr", type=float,
                    help="learning rate of the l0 edge masks (default: --gate-lr)")
+    p.add_argument("--cycle-len", default="0",
+                   help="residual cycle forecasting with a learnable cycle of this many steps per signal; 'daily' "
+                   "uses one day of the dataset (ETTm 96, Weather 144, Traffic 24); 0 disables it")
     p.add_argument("--tree-widths", default="",
                    help="comma-separated width per merge level (multiples of num_heads * 8); the last one repeats; "
                    "empty = d_model at every level")
@@ -208,6 +213,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         unknown = set(args.time_fields) - set(TIME_FIELDS)
         if unknown:
             p.error(f"unknown time features: {', '.join(sorted(unknown))}")
+    if args.cycle_len == "daily":
+        if args.dataset not in DAILY_STEPS:
+            p.error(f"--cycle-len daily is not defined for {args.dataset}")
+        args.cycle_len = DAILY_STEPS[args.dataset]
+    else:
+        args.cycle_len = int(args.cycle_len)
+    if args.cycle_len and (args.dataset in LOB_DATASETS or args.architecture == "tree"):
+        p.error("--cycle-len applies to forecasting with the plain or cross architecture")
     presets = dict(PRESETS[args.dataset])
     if args.channel_independent:
         presets.update(CI_PRESETS.get(args.dataset, {}))
@@ -255,8 +268,9 @@ def effective_config(args: argparse.Namespace, num_signals: int) -> dict:
 class DeviceWindows:
     """A split held on the training device; batches of windows are sliced there by index.
 
-    Forecasting windows yield (x, y, t_in, t_out) with y (B, C, pred_len); classification windows (LobWindows)
-    yield (x, y, None, None) with y (B,) the class of the window's last event."""
+    Forecasting windows yield (x, y, t_in, t_out, phase) with y (B, C, pred_len) and phase (B,) the absolute time
+    step of each window's first input step; classification windows (LobWindows) yield (x, y, None, None, None)
+    with y (B,) the class of the window's last event."""
 
     def __init__(self, windows: ForecastWindows | LobWindows, device: str, use_time: bool) -> None:
         self.values = windows.values.to(device)  # (C, T)
@@ -267,6 +281,7 @@ class DeviceWindows:
         span = windows.seq_len if self.labels is not None else windows.seq_len + windows.pred_len
         self.offsets = torch.arange(span, device=device)
         self.num_windows = len(windows)
+        self.first = getattr(windows, "first", 0)
         self.device = device
 
     def batch(self, index: torch.Tensor):
@@ -274,12 +289,13 @@ class DeviceWindows:
         positions = starts[:, None] + self.offsets  # (B, span)
         segment = self.values[:, positions].permute(1, 0, 2)  # (B, C, span)
         if self.labels is not None:
-            return segment, self.labels[starts + self.seq_len - 1], None, None
+            return segment, self.labels[starts + self.seq_len - 1], None, None, None
         x, y = segment[..., : self.seq_len], segment[..., self.seq_len :]
+        phase = starts + self.first
         if self.times is None:
-            return x, y, None, None
+            return x, y, None, None, phase
         times = self.times[positions]  # (B, seq_len + pred_len, time_dim)
-        return x, y, times[:, : self.seq_len], times[:, self.seq_len :]
+        return x, y, times[:, : self.seq_len], times[:, self.seq_len :], phase
 
     def batches(
         self,
@@ -325,6 +341,8 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
     # faster gate learning rate: at the model learning rate (round 8) they never closed a single edge
     edges = [p for name, p in model.named_parameters() if name.endswith("edge_gate")]
     masks = [p for name, p in model.named_parameters() if name.endswith("edge_mask.log_alpha")]
+    # The learnable cycle is a signal level, not a weight: no weight decay
+    cycle = [model.cycle] if getattr(model, "cycle", None) is not None else []
     muon_params = []
     if args.optimizer == "muon":
         if isinstance(model, TreeSignalformer):
@@ -332,7 +350,7 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
         else:
             blocks = [*model.encoder.blocks, *model.decoder.blocks]
         muon_params = [m.weight for b in blocks for m in b.modules() if isinstance(m, torch.nn.Linear)]
-    special = {id(p) for p in [*muon_params, *gate, *pairing, *edges, *masks]}
+    special = {id(p) for p in [*muon_params, *gate, *pairing, *edges, *masks, *cycle]}
     adamw_params = [p for p in model.parameters() if id(p) not in special]
     groups = [{"params": adamw_params, "lr": args.lr, "weight_decay": args.weight_decay}]
     if gate:
@@ -343,6 +361,8 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
         groups.append({"params": edges, "lr": args.lr, "weight_decay": 0.0})
     if masks:
         groups.append({"params": masks, "lr": args.edge_mask_lr, "weight_decay": 0.0})
+    if cycle:
+        groups.append({"params": cycle, "lr": args.lr, "weight_decay": 0.0})
     optimizers: list[torch.optim.Optimizer] = [torch.optim.AdamW(groups)]
     if muon_params:
         optimizers.append(torch.optim.Muon(
@@ -363,11 +383,11 @@ def evaluate(forward, model, data: DeviceWindows, batch_size: int, autocast, sub
     ae = torch.zeros((), device=data.device)
     confusion = torch.zeros(len(LOB_CLASSES), len(LOB_CLASSES), device=data.device)
     count = 0
-    for step, (x, y, t_in, t_out) in enumerate(data.batches(batch_size, subset=subset)):
+    for step, (x, y, t_in, t_out, phase) in enumerate(data.batches(batch_size, subset=subset)):
         if max_steps is not None and step >= max_steps:
             break
         with autocast():
-            pred = forward(x, t_in, t_out)
+            pred = forward(x, t_in, t_out, phase=phase) if getattr(model, "cycle", None) is not None else forward(x, t_in, t_out)
         if classify:
             loss += torch.nn.functional.cross_entropy(pred.float(), y, reduction="sum")
             confusion.index_put_((y, pred.argmax(dim=1)), torch.ones_like(y, dtype=confusion.dtype), accumulate=True)
@@ -441,6 +461,7 @@ def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.
         cross_parallel=args.cross_parallel,
         edge_gates=args.edge_gates,
         num_classes=num_classes,
+        cycle_len=args.cycle_len,
     )
 
 
@@ -558,7 +579,7 @@ def main() -> None:
             order, first, total = train.window_order(shuffle=True), 0, torch.zeros((), device=args.device)
         interval, interval_steps = torch.zeros((), device=args.device), 0
         batches = train.batches(args.batch_size, drop_last=True, order=order, start=first)
-        for step, (x, y, t_in, t_out) in enumerate(batches, start=first):
+        for step, (x, y, t_in, t_out, phase) in enumerate(batches, start=first):
             if step >= steps_per_epoch:
                 break
             for optimizer in optimizers:
@@ -568,7 +589,7 @@ def main() -> None:
                 progress = global_step / max(1, total_steps - 1)
                 tree_model.pair_temperature = temp_start + (temp_end - temp_start) * progress
             with autocast():
-                pred = forward(x, t_in, t_out)
+                pred = forward(x, t_in, t_out, phase=phase) if getattr(model, "cycle", None) is not None else forward(x, t_in, t_out)
                 if classify:
                     sample_loss = torch.nn.functional.cross_entropy(pred.float(), y, reduction="none")  # (B,)
                 else:

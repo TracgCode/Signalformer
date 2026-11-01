@@ -159,11 +159,18 @@ VARIANTS = {
     # of multi-head attention, with and without the L0 edges (cross_gate_l0_fast is the serial counterpart)
     "cross_par": ["--architecture", "cross", *PATCH8, "--cross-parallel"],
     "cross_par_l0": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0"],
+    # Round 15: residual cycle forecasting with a learnable daily cycle per signal (as in CycleNet, TQNet and
+    # PAMNet), and more dropout against the overfitting of the Cross Transformer on ETTm2 at long horizons
+    "patch8_cycle": [*PATCH8, "--cycle-len", "daily"],
+    "cross_par_l0_cycle": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                           "--cycle-len", "daily"],
+    "cross_par_l0_drop": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                          "--dropout", "0.3"],
 }
-# Round 14: channel independence with patching and the serial and parallel L0 Cross Transformers on ETTm1, ETTm2 and
-# Weather at horizons 192, 336 and 720 (run with --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720). Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
+# Round 15: the learnable daily cycle and more dropout on ETTm1, ETTm2 and Weather at horizons 96 to 720 (run with
+# --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720). Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
 # they only helped at input 336 on two datasets, within noise.
-DEFAULT_VARIANTS = ["patch8", "cross_gate_l0_fast", "cross_par_l0"]
+DEFAULT_VARIANTS = ["patch8_cycle", "cross_par_l0_cycle", "cross_par_l0_drop"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 # Variants that only run on some datasets (others show "–" in the summary)
 VARIANT_DATASETS = {
@@ -194,6 +201,9 @@ VARIANT_DATASETS = {
     "f144_e2d2": ("FI2010",),
     "cross_par": CROSS_DATASETS,
     "cross_par_l0": CROSS_DATASETS,
+    "patch8_cycle": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_drop": ("ETTm1", "ETTm2", "Weather"),
     # Width and depth on the small presets; Traffic already uses d_model 64 and two encoder layers
     "patch8_d64": ("ETTm1", "ETTm2", "Weather"),
     "patch8_e2d2": ("ETTm1", "ETTm2", "Weather"),

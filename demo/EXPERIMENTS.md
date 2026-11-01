@@ -558,3 +558,21 @@ Results, test MSE (Avg is the mean over the four horizons). The published rows a
 - Serial and parallel blocks still tie (averages within 0.002 on every dataset), so the parallel block stays the default Cross Transformer.
 - Nine runs failed at first because another process held 25.7 GB of the GPU, and the six Weather horizon-720 Cross Transformer runs were finished on a second machine. Its environment first had Python 3.15, where `torch.compile` is not supported: the three `cross_gate_l0_fast` runs ran with `--no-compile`, and the three `cross_par_l0` runs ran out of memory two at a time (about 21 GB each without compilation) and were run one at a time after a downgrade to Python 3.14, with compilation (the first resumed from its epoch-5 checkpoint). Compilation changes only speed and memory, not the results.
 
+## Round 15 (prepared, not run yet): a learnable daily cycle, and more dropout
+
+The models ahead of ours in round 14 share one ingredient: CycleNet, TQNet and PAMNet all model the periodic structure of the data explicitly. CycleNet's residual cycle forecasting is the simplest form: a learnable cycle of W steps per signal, indexed by the absolute time step modulo W, is subtracted from the normalized input window, the backbone forecasts the residual, and the cycle of the forecast steps is added back. It needs no new layers, only C x W parameters.
+
+`--cycle-len W` (`Signalformer(cycle_len=W)`) adds it to our model, with W one day (`daily`: 96 steps on ETTm, 144 on Weather). The cycle is learned with the model learning rate and no weight decay; each window is normalized by its own mean and std before the cycle is subtracted, and the model's RevIN then runs on the residual. The absolute time step of each window comes from the split borders, so the phase is the same in training, validation and test.
+
+| Variant | Question |
+|---|---|
+| `patch8_cycle` | Does the learnable cycle close the gap to CycleNet / PAMNet with channel independence, above all on ETTm2 where the Cross Transformer did not help? |
+| `cross_par_l0_cycle` | Does it add to the exchange between the signals, or do they capture the same structure (Weather, ETTm1)? |
+| `cross_par_l0_drop` | Does dropout 0.3 (instead of 0.2) stop the Cross Transformer from overfitting ETTm2 at the long horizons? |
+
+ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720, input 96, 3 seeds: 108 runs. The references are the table of round 14.
+
+```bash
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 15
+```
+

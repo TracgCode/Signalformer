@@ -103,9 +103,11 @@ def split_borders(length: int, seq_len: int, spec: DatasetSpec) -> list[tuple[in
 
 
 class ForecastWindows(Dataset):
-    """Sliding windows: x (C, seq_len), y (C, pred_len), plus time features for both (possibly 0-wide)."""
+    """Sliding windows: x (C, seq_len), y (C, pred_len), plus time features for both (possibly 0-wide).
+    first is the absolute time step of the split's first row in the full series (for cycle phases)."""
 
-    def __init__(self, values: np.ndarray, times: np.ndarray, seq_len: int, pred_len: int) -> None:
+    def __init__(self, values: np.ndarray, times: np.ndarray, seq_len: int, pred_len: int, first: int = 0) -> None:
+        self.first = first
         self.values = torch.from_numpy(values.T.copy())  # (C, T)
         self.times = torch.from_numpy(times)  # (T, TIME_DIM)
         self.seq_len, self.pred_len = seq_len, pred_len
@@ -133,7 +135,7 @@ def build_splits(
     values = (values - mean) / std
     times = time_features(dates, time_fields)
     return {
-        split: ForecastWindows(values[start:end], times[start:end], seq_len, pred_len)
+        split: ForecastWindows(values[start:end], times[start:end], seq_len, pred_len, first=start)
         for split, (start, end) in zip(("train", "val", "test"), borders)
     }
 

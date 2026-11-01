@@ -88,6 +88,13 @@ class Signalformer(nn.Module):
     per-step FFN across signals (C -> 4 * max(C, output_signals) -> output_signals). It runs after RevIN has
     restored the input scale, since new output signals have no RevIN statistics of their own.
 
+    cycle_len = W > 0 adds residual cycle forecasting (as in CycleNet): a learnable cycle of W steps per signal,
+    shared by all windows and indexed by the absolute time step modulo W (forward's phase argument, the absolute
+    index of each window's first input step). Each input window is normalized per signal (mean 0, std 1 over the
+    window), the cycle values of its steps are subtracted, the rest of the model forecasts the residual, and the
+    cycle values of the forecast steps are added back before the window's mean and std are restored. Set W to
+    the period of the data in steps (one day: 96 at 15 minutes, 144 at 10 minutes).
+
     num_classes > 0 turns the model into a classifier of the whole window: the decoder features are averaged
     over the decoder steps, the per-signal averages are concatenated (C * d_model with channel independence),
     and an FFN maps them to num_classes logits. forward then returns (N, num_classes); the forecast head, RevIN
@@ -129,6 +136,7 @@ class Signalformer(nn.Module):
         edge_gates: bool | str = False,
         output_signals: int = 0,
         num_classes: int = 0,
+        cycle_len: int = 0,
     ):
         super().__init__()
         if revin:
@@ -144,6 +152,11 @@ class Signalformer(nn.Module):
         assert not cross_parallel or cross_decoder, "cross_parallel requires cross_decoder=True"
         assert output_signals in (0, in_channels) or channel_independent, "output_signals requires channel_independent"
         assert num_classes == 0 or output_signals in (0, in_channels), "num_classes replaces the output projection"
+        assert cycle_len == 0 or (num_classes == 0 and out_channels == in_channels and output_signals in (0, in_channels)), (
+            "cycle_len requires a forecast of the input signals"
+        )
+        self.cycle = nn.Parameter(torch.zeros(cycle_len, in_channels)) if cycle_len > 0 else None
+        self.output_length = output_length
         if num_classes > 0:
             if channel_independent:
                 width = (ci_latents or in_channels) * d_model
@@ -208,6 +221,28 @@ class Signalformer(nn.Module):
         self.raw_embed = nn.Linear(in_channels, d_model) if raw_tokens else None
 
     def forward(
+        self,
+        input: torch.Tensor,
+        time_features: torch.Tensor | None = None,
+        future_time_features: torch.Tensor | None = None,
+        text_memory: torch.Tensor | None = None,
+        text_padding_mask: torch.Tensor | None = None,
+        phase: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # phase: (N,) absolute time step of each window's first input step, required with cycle_len > 0
+        if self.cycle is None:
+            return self.forward_residual(input, time_features, future_time_features, text_memory, text_padding_mask)
+        assert phase is not None, "phase is required with cycle_len > 0"
+        input_len, output_len = input.size(-1), self.output_length
+        steps = torch.arange(input_len + output_len, device=input.device)
+        cycle = self.cycle[(phase[:, None] + steps) % self.cycle.size(0)].transpose(1, 2)  # (N, C, L + H)
+        mean = input.mean(dim=-1, keepdim=True)
+        std = (input.var(dim=-1, keepdim=True, unbiased=False) + 1e-5).sqrt()
+        residual = (input - mean) / std - cycle[..., :input_len]
+        output = self.forward_residual(residual, time_features, future_time_features, text_memory, text_padding_mask)
+        return (output + cycle[..., input_len:]) * std + mean
+
+    def forward_residual(
         self,
         input: torch.Tensor,
         time_features: torch.Tensor | None = None,

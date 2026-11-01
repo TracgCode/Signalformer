@@ -420,7 +420,7 @@ Results of the rerun with the warmup, test macro F1 (accuracy in brackets). No r
 python demo/run_benchmarks.py --rerun                               # round 12, with the warmup
 ```
 
-## Round 13 (prepared, not run yet): the parallel Cross Transformer
+## Round 13: the parallel Cross Transformer (3 seeds)
 
 The serial Cross Transformer reads the C signals one after another: for j = 1 .. C every signal's decoder cross-attends to signal j's memory and adds the result before it reads signal j + 1. The result depends on the order of the signals in the dataset, and the keys and values of every signal are projected C times. It tied channel independence on FI-2010 (rounds 9 and 10) at about ten times the cost.
 
@@ -444,3 +444,117 @@ On FI-2010 the new runs use the warmup of round 12; the serial runs of rounds 9 
 ```bash
 python demo/run_benchmarks.py                                       # round 13
 ```
+
+Results, ETT and Weather at horizon 96, test MSE. Seconds per epoch are medians from the logs; they depend on how many runs shared the GPU, so they are only indicative.
+
+| Model | Params (ETTm1) | ETTm1 | ETTm2 | Weather | s / epoch (Weather) |
+|---|---|---|---|---|---|
+| *Naive (repeat last value)* | | *1.214* | *0.266* | *0.259* | |
+| *PatchTST* | | *0.329* | *0.175* | *0.177* | |
+| *iTransformer* | | *0.334* | *0.180* | *0.174* | |
+| `patch8` (round 7) | 39k | 0.323 ± 0.007 | 0.182 ± 0.001 | 0.175 ± 0.001 | 5 |
+| `cross_patch8` (serial, round 7) | 39k | 0.362 ± 0.004 | 0.192 ± 0.001 | 0.185 ± 0.002 | 15 |
+| `cross_gate_l0_fast` (serial, round 9) | 39k | **0.321 ± 0.006** | 0.185 ± 0.004 | 0.159 ± 0.001 | 16 |
+| `cross_par` | 45k | 0.356 ± 0.007 | 0.206 ± 0.008 | 0.166 ± 0.004 | 11 |
+| `cross_par_l0` | 45k | 0.325 ± 0.005 | **0.181 ± 0.003** | **0.159 ± 0.003** | 13 |
+
+FI-2010, 40 features, test macro F1. "Edges kept" is the share of off-diagonal L0 edges still open at the end of training.
+
+| Model | Params (k = 10) | k = 10 | k = 50 | k = 100 | s / epoch (k = 10) | Edges kept |
+|---|---|---|---|---|---|---|
+| *Test class shares (up / stationary / down)* | | *15 / 71 / 14%* | *27 / 47 / 25%* | *34 / 35 / 31%* | | |
+| *DeepLOB (retrained)* | | *0.711* | *0.754* | *0.776* | | |
+| *BiN-CTABL (retrained)* | | *0.811* | *0.877* | *0.921* | | |
+| *TLOB (2025, 144 features)* | | *0.816* | *0.900* | *0.928* | | |
+| *MLPLOB (2025, 144 features)* | | *0.816* | *0.914* | *0.926* | | |
+| `patch8` (round 10) | 201k | 0.811 ± 0.001 | 0.880 ± 0.000 | 0.927 ± 0.001 | 19 | |
+| `cross_gate_l0_fast` (serial, round 10) | 205k | **0.812 ± 0.001** | 0.879 ± 0.001 | 0.926 ± 0.002 | 221 | 31 / 56 / 59% |
+| `cross_par` | 242k | 0.810 ± 0.001 | **0.880 ± 0.001** | 0.927 ± 0.001 | 62 | |
+| `cross_par_l0` | 245k | **0.812 ± 0.001** | **0.880 ± 0.001** | **0.928 ± 0.000** | 65 | 3 / 9 / 12% |
+
+- With the L0 edges the parallel block matches the serial one everywhere: the six differences are all within the seed spread. On FI-2010 it is about 3.4 times faster per epoch (65 s against 221 s at k = 10), and still faster on ETT and Weather. It costs about 15% more parameters, almost all in the C * D -> D output projection. The parallel block replaces the serial one from here on.
+- Without edge gates, reading every signal hurts, in parallel as well as in series: `cross_par` is 0.033 worse than `patch8` on ETTm1 and 0.024 worse on ETTm2. Only with the L0 edges, which close most connections (67 to 74% on ETT), does it tie `patch8`.
+- Weather is the one dataset where exchanging information between the signals clearly pays: 0.175 → 0.159, below every reference at input 96. Its 21 weather variables are strongly related, and the L0 edges keep 58% of the connections there, far more than on ETT.
+- On FI-2010 with 40 features the parallel L0 block closes almost every edge (3% kept at k = 10, 9% at k = 50, 12% at k = 100, against 31 to 59% for the serial block) and the score does not move (0.928 at k = 100 is 0.001 above `patch8`, within noise). The serial block's open edges were not doing anything either. The order book levels need no cross-signal exchange beyond what channel independence gives; the gains on FI-2010 came from the 104 handcrafted features (rounds 11 and 12).
+- The parallel FI-2010 runs use the warmup of round 12; none was flagged `STUCK`.
+
+During the sweep the disk holding `demo/runs` filled up (from other data, not the checkpoints) and two FI-2010 k = 100 runs failed while saving a checkpoint. Resuming them then exposed a bug: `torch.load(map_location="cuda")` moved the saved RNG states to the GPU, and `torch.set_rng_state` only accepts CPU tensors. Fixed by moving them back to the CPU before restoring; the two runs resumed from their last checkpoints (epoch 6).
+
+
+## Round 14: longer horizons on ETT and Weather (3 seeds)
+
+Every forecasting result so far is at horizon 96, while published tables report horizons 96, 192, 336 and 720 and their average. This round fills in the longer horizons for channel independence with patching and for the two L0 Cross Transformers, so the comparison covers the full table.
+
+| Variant | Question |
+|---|---|
+| `patch8` | Channel independence with patching: does its lead over PatchTST at 96 (ETTm1) hold at longer horizons? |
+| `cross_gate_l0_fast`, `cross_par_l0` | Does the Weather gain from exchanging information between the signals (0.175 → 0.159 at 96) grow or shrink with the horizon, and do the serial and parallel blocks still tie? |
+
+ETTm1, ETTm2 and Weather at horizons 192, 336 and 720 (the horizon-96 runs exist), input 96, 3 seeds: 81 runs.
+
+Published results at input 96, test MSE. TimeXer from the full results table of its paper (NeurIPS 2024, Table 12); all others from the full results table of the PAMNet paper (arXiv 2605.02938, Table 7), whose DLinear, TimesNet, PatchTST and iTransformer rows match the iTransformer paper (ICLR 2024). All are single runs.
+
+| Dataset | Model | 96 | 192 | 336 | 720 | Avg |
+|---|---|---|---|---|---|---|
+| ETTm1 | DLinear (2023) | 0.345 | 0.380 | 0.413 | 0.474 | 0.403 |
+|  | TimesNet (2023) | 0.338 | 0.374 | 0.410 | 0.478 | 0.400 |
+|  | PatchTST (2023) | 0.329 | 0.367 | 0.399 | 0.454 | 0.387 |
+|  | iTransformer (2024) | 0.334 | 0.377 | 0.426 | 0.491 | 0.407 |
+|  | TimeXer (2024) | 0.318 | 0.362 | 0.395 | 0.452 | 0.382 |
+|  | CycleNet (2024) | 0.319 | 0.360 | 0.389 | 0.447 | 0.379 |
+|  | TQNet (2025) | 0.311 | 0.356 | 0.390 | 0.452 | 0.377 |
+|  | PAMNet (2026) | 0.308 | 0.353 | 0.375 | 0.425 | 0.365 |
+| ETTm2 | DLinear (2023) | 0.193 | 0.284 | 0.369 | 0.554 | 0.350 |
+|  | TimesNet (2023) | 0.187 | 0.249 | 0.321 | 0.408 | 0.291 |
+|  | PatchTST (2023) | 0.175 | 0.241 | 0.305 | 0.402 | 0.281 |
+|  | iTransformer (2024) | 0.180 | 0.250 | 0.311 | 0.412 | 0.288 |
+|  | TimeXer (2024) | 0.171 | 0.237 | 0.296 | 0.392 | 0.274 |
+|  | CycleNet (2024) | 0.163 | 0.229 | 0.284 | 0.389 | 0.266 |
+|  | TQNet (2025) | 0.173 | 0.238 | 0.301 | 0.397 | 0.277 |
+|  | PAMNet (2026) | 0.165 | 0.227 | 0.285 | 0.380 | 0.264 |
+| Weather | DLinear (2023) | 0.196 | 0.237 | 0.283 | 0.345 | 0.265 |
+|  | TimesNet (2023) | 0.172 | 0.219 | 0.280 | 0.365 | 0.259 |
+|  | PatchTST (2023) | 0.177 | 0.225 | 0.278 | 0.354 | 0.259 |
+|  | iTransformer (2024) | 0.174 | 0.221 | 0.278 | 0.358 | 0.258 |
+|  | TimeXer (2024) | 0.157 | 0.204 | 0.261 | 0.340 | 0.241 |
+|  | CycleNet (2024) | 0.158 | 0.207 | 0.262 | 0.344 | 0.243 |
+|  | TQNet (2025) | 0.157 | 0.206 | 0.262 | 0.344 | 0.242 |
+|  | PAMNet (2026) | 0.154 | 0.202 | 0.260 | 0.343 | 0.240 |
+
+```bash
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 14
+```
+
+Results, test MSE (Avg is the mean over the four horizons). The published rows are the strongest of the table above plus PatchTST; the horizon-96 runs are from round 13.
+
+| Dataset | Model | 96 | 192 | 336 | 720 | Avg |
+|---|---|---|---|---|---|---|
+| ETTm1 | *Naive (repeat last value)* | *1.214* | *1.261* | *1.287* | *1.322* | *1.271* |
+| | *PatchTST (2023)* | *0.329* | *0.367* | *0.399* | *0.454* | *0.387* |
+| | *TQNet (2025)* | *0.311* | *0.356* | *0.390* | *0.452* | *0.377* |
+| | *PAMNet (2026)* | ***0.308*** | ***0.353*** | ***0.375*** | ***0.425*** | ***0.365*** |
+| | `patch8` | 0.323 ± 0.007 | 0.371 ± 0.006 | 0.392 ± 0.001 | 0.452 ± 0.002 | 0.384 |
+| | `cross_gate_l0_fast` | 0.321 ± 0.006 | 0.357 ± 0.003 | 0.385 ± 0.003 | 0.445 ± 0.003 | 0.377 |
+| | `cross_par_l0` | 0.325 ± 0.005 | 0.358 ± 0.004 | 0.385 ± 0.001 | 0.441 ± 0.003 | 0.377 |
+| ETTm2 | *Naive (repeat last value)* | *0.266* | *0.340* | *0.412* | *0.522* | *0.385* |
+| | *PatchTST (2023)* | *0.175* | *0.241* | *0.305* | *0.402* | *0.281* |
+| | *CycleNet (2024)* | ***0.163*** | *0.229* | ***0.284*** | *0.389* | *0.266* |
+| | *PAMNet (2026)* | *0.165* | ***0.227*** | *0.285* | ***0.380*** | ***0.264*** |
+| | `patch8` | 0.182 ± 0.001 | 0.252 ± 0.001 | 0.322 ± 0.005 | 0.417 ± 0.002 | 0.293 |
+| | `cross_gate_l0_fast` | 0.185 ± 0.004 | 0.254 ± 0.002 | 0.330 ± 0.006 | 0.461 ± 0.011 | 0.307 |
+| | `cross_par_l0` | 0.181 ± 0.003 | 0.261 ± 0.008 | 0.341 ± 0.024 | 0.436 ± 0.015 | 0.305 |
+| Weather | *Naive (repeat last value)* | *0.259* | *0.309* | *0.376* | *0.465* | *0.352* |
+| | *PatchTST (2023)* | *0.177* | *0.225* | *0.278* | *0.354* | *0.259* |
+| | *TimeXer (2024)* | *0.157* | *0.204* | *0.261* | ***0.340*** | *0.241* |
+| | *PAMNet (2026)* | ***0.154*** | ***0.202*** | ***0.260*** | *0.343* | ***0.240*** |
+| | `patch8` | 0.175 ± 0.001 | 0.223 ± 0.001 | 0.278 ± 0.000 | 0.357 ± 0.001 | 0.258 |
+| | `cross_gate_l0_fast` | 0.159 ± 0.001 | 0.207 ± 0.002 | 0.268 ± 0.001 | 0.349 ± 0.003 | 0.246 |
+| | `cross_par_l0` | 0.159 ± 0.003 | 0.210 ± 0.002 | 0.269 ± 0.002 | 0.352 ± 0.003 | 0.248 |
+
+- Against the 2023 and 2024 baselines the picture of horizon 96 holds: both L0 Cross Transformers beat PatchTST and iTransformer on average on ETTm1 (0.377 against 0.387 / 0.407) and Weather (0.246 to 0.248 against 0.259 / 0.258), and tie TQNet on ETTm1. Against the newest models they do not: PAMNet is 0.012 ahead on ETTm1 and 0.006 to 0.008 on Weather, and TimeXer, CycleNet and TQNet are 0.004 to 0.006 ahead on Weather.
+- On ETTm1 exchanging information between the signals helps more with the horizon: at 96 all three variants tie, from 192 on the Cross Transformers lead `patch8` by 0.007 to 0.014.
+- On Weather the gain of the cross blocks over `patch8` shrinks with the horizon (0.016 at 96, 0.010 at 336, 0.005 to 0.008 at 720). The L0 edges keep 47 to 59% of the connections at every horizon.
+- On ETTm2 the Cross Transformers overfit at the long horizons: their training loss ends lower than `patch8`'s (0.49 to 0.52 against 0.56 at 720) while validation is the same or worse and test is worse (0.436 to 0.461 against 0.417), with a seed spread up to 0.024. `patch8` is the best of ours there and still 0.012 to 0.029 behind PatchTST at every horizon. ETTm2 is where channel independence without exchange is the safe choice, as it was at 96.
+- Serial and parallel blocks still tie (averages within 0.002 on every dataset), so the parallel block stays the default Cross Transformer.
+- Nine runs failed at first because another process held 25.7 GB of the GPU, and the six Weather horizon-720 Cross Transformer runs were finished on a second machine. Its environment first had Python 3.15, where `torch.compile` is not supported: the three `cross_gate_l0_fast` runs ran with `--no-compile`, and the three `cross_par_l0` runs ran out of memory two at a time (about 21 GB each without compilation) and were run one at a time after a downgrade to Python 3.14, with compilation (the first resumed from its epoch-5 checkpoint). Compilation changes only speed and memory, not the results.
+

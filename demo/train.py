@@ -538,9 +538,9 @@ def main() -> None:
                 scheduler.load_state_dict(saved)
             best_val, best_state, bad_epochs = state["best_val"], state["best_state"], state["bad_epochs"]
             history, step_log = state["history"], state["step_log"]
-            torch.set_rng_state(state["rng"])
+            torch.set_rng_state(state["rng"].cpu())
             if state["cuda_rng"] is not None:
-                torch.cuda.set_rng_state_all(state["cuda_rng"])
+                torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda_rng"]])
             first_epoch, first_step, resumed_total = state["epoch"], state["step"], state["total"]
             if state["order"] is not None:
                 resumed_order = state["order"].to(args.device)

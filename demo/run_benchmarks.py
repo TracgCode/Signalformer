@@ -160,10 +160,10 @@ VARIANTS = {
     "cross_par": ["--architecture", "cross", *PATCH8, "--cross-parallel"],
     "cross_par_l0": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0"],
 }
-# Round 13: the parallel Cross Transformer on ETTm1, ETTm2 and Weather (horizon 96) and on FI-2010 with the 40 order
-# book features (horizons 10, 50 and 100), against the serial cross_gate_l0_fast of rounds 9 and 10. Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
+# Round 14: channel independence with patching and the serial and parallel L0 Cross Transformers on ETTm1, ETTm2 and
+# Weather at horizons 192, 336 and 720 (run with --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720). Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
 # they only helped at input 336 on two datasets, within noise.
-DEFAULT_VARIANTS = ["cross_par", "cross_par_l0"]
+DEFAULT_VARIANTS = ["patch8", "cross_gate_l0_fast", "cross_par_l0"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 # Variants that only run on some datasets (others show "–" in the summary)
 VARIANT_DATASETS = {

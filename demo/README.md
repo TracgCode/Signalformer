@@ -43,7 +43,7 @@ FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py                                  # round 13: parallel Cross Transformer on ETTm1, ETTm2, Weather and FI-2010, 3 seeds
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 14: longer horizons, 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
@@ -53,7 +53,9 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 
 The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-Round 13, the default sweep (ETTm1, ETTm2 and Weather at horizon 96, FI-2010 with the 40 order book features at horizons 10, 50 and 100):
+Round 14, the default variants (`patch8`, `cross_gate_l0_fast`, `cross_par_l0`) on ETTm1, ETTm2 and Weather at horizons 192, 336 and 720; no new variants.
+
+Round 13 (ETTm1, ETTm2 and Weather at horizon 96, FI-2010 with the 40 order book features at horizons 10, 50 and 100):
 
 | Variant | Change from `cross_patch8` |
 |---|---|

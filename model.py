@@ -93,7 +93,9 @@ class Signalformer(nn.Module):
     index of each window's first input step). Each input window is normalized per signal (mean 0, std 1 over the
     window), the cycle values of its steps are subtracted, the rest of the model forecasts the residual, and the
     cycle values of the forecast steps are added back before the window's mean and std are restored. Set W to
-    the period of the data in steps (one day: 96 at 15 minutes, 144 at 10 minutes).
+    the period of the data in steps (one day: 96 at 15 minutes, 144 at 10 minutes). cycle_renorm=True (the
+    default) lets RevIN normalize the residual once more; cycle_renorm=False skips RevIN on the residual, so the
+    window is normalized only once, as in CycleNet.
 
     num_classes > 0 turns the model into a classifier of the whole window: the decoder features are averaged
     over the decoder steps, the per-signal averages are concatenated (C * d_model with channel independence),
@@ -137,6 +139,7 @@ class Signalformer(nn.Module):
         output_signals: int = 0,
         num_classes: int = 0,
         cycle_len: int = 0,
+        cycle_renorm: bool = True,
     ):
         super().__init__()
         if revin:
@@ -156,6 +159,7 @@ class Signalformer(nn.Module):
             "cycle_len requires a forecast of the input signals"
         )
         self.cycle = nn.Parameter(torch.zeros(cycle_len, in_channels)) if cycle_len > 0 else None
+        self.cycle_renorm = cycle_renorm
         self.output_length = output_length
         if num_classes > 0:
             if channel_independent:
@@ -239,7 +243,9 @@ class Signalformer(nn.Module):
         mean = input.mean(dim=-1, keepdim=True)
         std = (input.var(dim=-1, keepdim=True, unbiased=False) + 1e-5).sqrt()
         residual = (input - mean) / std - cycle[..., :input_len]
-        output = self.forward_residual(residual, time_features, future_time_features, text_memory, text_padding_mask)
+        output = self.forward_residual(
+            residual, time_features, future_time_features, text_memory, text_padding_mask, normalize=self.cycle_renorm
+        )
         return (output + cycle[..., input_len:]) * std + mean
 
     def forward_residual(
@@ -249,7 +255,9 @@ class Signalformer(nn.Module):
         future_time_features: torch.Tensor | None = None,
         text_memory: torch.Tensor | None = None,
         text_padding_mask: torch.Tensor | None = None,
+        normalize: bool = True,
     ) -> torch.Tensor:
+        # normalize=False skips RevIN (the cycle path has normalized the window already)
         # input: (N, C, L), time_features: (N, L, time_dim)
         # future_time_features: (N, output_length * samples_per_output, time_dim)
         # text_memory: (N, L_text, text_dim), text_padding_mask: (N, L_text) bool, True = padding
@@ -273,7 +281,7 @@ class Signalformer(nn.Module):
             repeat = lambda t: None if t is None else t.repeat_interleave(num_signals, dim=0)  # noqa: E731
             time_features, future_time_features = repeat(time_features), repeat(future_time_features)
             text_memory, text_padding_mask = repeat(text_memory), repeat(text_padding_mask)
-        if self.revin is not None and self.latent_proj is None:
+        if self.revin is not None and self.latent_proj is None and normalize:
             input, stats = self.revin.normalize(input)
         freq_memory = self.freq_embed(input) if self.freq_embed is not None else None  # (N, L // 2 + 1, d_model)
         raw_memory = self.raw_embed(input.transpose(1, 2)) if self.raw_embed is not None else None  # (N, L, d_model)

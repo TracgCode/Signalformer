@@ -166,11 +166,15 @@ VARIANTS = {
                            "--cycle-len", "daily"],
     "cross_par_l0_drop": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
                           "--dropout", "0.3"],
+    # Round 16: the cycle with one normalization, as in CycleNet (round 15 let RevIN normalize the residual again)
+    "patch8_cycle_once": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once"],
+    "cross_par_l0_cycle_once": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                "--cycle-len", "daily", "--cycle-norm", "once"],
 }
-# Round 15: the learnable daily cycle and more dropout on ETTm1, ETTm2 and Weather at horizons 96 to 720 (run with
+# Round 16: the learnable daily cycle normalized once, on ETTm1, ETTm2 and Weather at horizons 96 to 720 (run with
 # --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720). Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
 # they only helped at input 336 on two datasets, within noise.
-DEFAULT_VARIANTS = ["patch8_cycle", "cross_par_l0_cycle", "cross_par_l0_drop"]
+DEFAULT_VARIANTS = ["patch8_cycle_once", "cross_par_l0_cycle_once"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 # Variants that only run on some datasets (others show "–" in the summary)
 VARIANT_DATASETS = {
@@ -204,6 +208,8 @@ VARIANT_DATASETS = {
     "patch8_cycle": ("ETTm1", "ETTm2", "Weather"),
     "cross_par_l0_cycle": ("ETTm1", "ETTm2", "Weather"),
     "cross_par_l0_drop": ("ETTm1", "ETTm2", "Weather"),
+    "patch8_cycle_once": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_once": ("ETTm1", "ETTm2", "Weather"),
     # Width and depth on the small presets; Traffic already uses d_model 64 and two encoder layers
     "patch8_d64": ("ETTm1", "ETTm2", "Weather"),
     "patch8_e2d2": ("ETTm1", "ETTm2", "Weather"),

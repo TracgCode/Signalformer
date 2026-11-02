@@ -231,7 +231,7 @@ python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather        # the fast d
 
 ## Round 9: FI-2010 and the L0 edges again (3 seeds)
 
-FI-2010 is the first financial dataset and the first classification task: from the 40 order book features (10 ask and 10 bid levels, price and volume) of the last 96 events, predict whether the mid-price moves up, stays or moves down over the next 10 events. Setup 2 of DeepLOB (7 days train, 3 days test); see the README for the protocol. It is a step toward M6-style tasks, which also need class probabilities instead of point forecasts. The classifier averages the decoder features over the decoder steps and concatenates them over the signals, so with channel independence the classification head is the only place where the order book levels meet; the Cross Transformer lets them exchange information before that.
+FI-2010 is the first financial dataset and the first classification task: from the 40 order book features (10 ask and 10 bid levels, price and volume) of the last 96 events, predict whether the mid-price moves up, stays or moves down over the next 10 events. Setup 2 of DeepLOB (7 days train, 3 days test); see the README for the protocol. An "event" in these FI-2010 sections is one column of the dataset files, which summarizes a block of 10 order book events, the unit in which DeepLOB, TLOB and MLPLOB also count their inputs. It is a step toward M6-style tasks, which also need class probabilities instead of point forecasts. The classifier averages the decoder features over the decoder steps and concatenates them over the signals, so with channel independence the classification head is the only place where the order book levels meet; the Cross Transformer lets them exchange information before that.
 
 The test set is 71% stationary (training 61%), so always predicting "stationary" gives 71% accuracy but a macro F1 of about 0.28; macro F1 is the main score. DeepLOB reports accuracy 84.47% and F1 83.40% at k = 10 with an input of 100 events (Setup 2, Table II). Its recall equals its accuracy, so its precision, recall and F1 are weighted by class support, not macro averages; compare it with our weighted F1. (F1 77.66% / accuracy 78.91% is its Setup 1 result.)
 
@@ -244,14 +244,14 @@ The test set is 71% stationary (training 61%), so always predicting "stationary"
 
 The round 8 Traffic variants are deferred.
 
-Results on FI-2010, k = 10, test set. Weighted F1 (by class support) is the metric DeepLOB reports; the published rows are copied from DeepLOB's Setup 2 table (input 100 events).
+Results on FI-2010, k = 10, test set. The published rows are copied from DeepLOB's Setup 2 table (input 100 events). Only DeepLOB's own F1 is weighted by class support (its recall equals its accuracy); the LSTM and TABL papers average precision, recall and F1 over the three classes, which is macro F1. The LSTM row is not strictly Setup 2: that paper uses its own preprocessing of the raw events (z-scored with the previous day) and its own labels.
 
 | Model | Weighted F1 | Macro F1 | Accuracy | Seconds per epoch |
 |---|---|---|---|---|
 | *Always "stationary"* | *0.587* | *0.276* | *0.708* | |
-| *LSTM (Tsantekidis et al. 2017)* | *0.663* | | | |
-| *B(TABL) (Tran et al. 2018)* | *0.692* | | *0.789* | |
-| *C(TABL) (Tran et al. 2018)* | *0.776* | | *0.847* | |
+| *LSTM (Tsantekidis et al. 2017)* | | *0.663* | | |
+| *B(TABL) (Tran et al. 2018)* | | *0.692* | *0.789* | |
+| *C(TABL) (Tran et al. 2018)* | | *0.776* | *0.847* | |
 | *DeepLOB (Zhang et al. 2019)* | *0.834* | | *0.845* | |
 | `ci_raw` | 0.866 ± 0.004 | 0.801 ± 0.008 | 0.870 | ~25 |
 | `patch8` | 0.873 ± 0.001 | 0.811 ± 0.001 | 0.876 | ~20 |
@@ -260,13 +260,13 @@ Results on FI-2010, k = 10, test set. Weighted F1 (by class support) is the metr
 | `cross_patch8_gate` | **0.874 ± 0.000** | 0.811 ± 0.001 | **0.879** | ~215 |
 | `cross_gate_l0_fast` | **0.874 ± 0.000** | **0.812 ± 0.001** | 0.878 | ~215 |
 
-Stronger LOB models at k = 10. Published F1 scores mix two metrics: the papers up to 2022 report weighted F1 (their recall equals their accuracy), while the LOBCAST benchmark (Prata et al. 2024) and TLOB (Berti et al. 2025) retrain every model in one framework and report macro F1. The macro rows are the fair comparison for our macro F1.
+Stronger LOB models at k = 10. Published F1 scores mix two metrics: DeepLOB, TransLOB and Axial-LOB report weighted F1 (their recall equals their accuracy), TABL averages over the classes (macro), while the LOBCAST benchmark (Prata et al. 2024) and TLOB (Berti et al. 2025) retrain every model in one framework and report macro F1. The macro rows are the fair comparison for our macro F1.
 
 | Model | Source | F1 type | k = 10 F1 | Input | Notes |
 |---|---|---|---|---|---|
 | *DeepLOB* | own paper, Setup 2 | weighted | *0.834* | 100 events, 40 features | |
 | *Axial-LOB (2022)* | own paper, 7/3 days | weighted | *0.851* | 40 features | |
-| *TransLOB (2020)* | own paper, 7/3 days | weighted | *0.887* | 100 events | LOBCAST could not reproduce it: 59.4 against a claimed 87.3 averaged over horizons, the largest gap in the benchmark |
+| *TransLOB (2020)* | own paper, 7/3 days | weighted | *0.887* | 100 events | LOBCAST could not reproduce it: 59.4 against a claimed 87.3 averaged over horizons, the largest gap in the benchmark (ATNBoF is next, 40.9 against 67.1, and has the lowest robustness score, 66.1 against TransLOB's 69.9) |
 | *DeepLOB* | TLOB table, retrained | macro | *0.711* | | 10 points below its own paper |
 | *Axial-LOB* | TLOB table, retrained | macro | *0.732* | | |
 | *BiN-CTABL (2021)* | TLOB table, retrained | macro | *0.811* | | the most robust model in LOBCAST (score 99.7) |
@@ -619,3 +619,20 @@ Results, test MSE (Avg is the mean over the four horizons). `patch8` and `cross_
 - Our cycle normalizes each window before subtracting the cycle and then runs the model's RevIN again on the residual; CycleNet runs RevIN only once. The second normalization may cost part of the gain where the cycle is weak relative to the residual; it is the first thing to test before adding the cycle to more variants.
 - Five Weather horizon-720 Cross Transformer runs ran out of memory two at a time (another user held 5.5 GB of the GPU) and were rerun one at a time.
 
+
+## Round 16 (prepared, not run yet): the cycle normalized once
+
+In round 15 each window is normalized by its own mean and std, the cycle is subtracted, and the model's RevIN then normalizes the residual a second time. CycleNet normalizes only once: the backbone sees the normalized window minus the cycle at its own scale. The second normalization rescales every residual to std 1, so a window that the cycle explains well (small residual) has its leftover noise blown up to the same size as a window it explains badly, and the backbone no longer sees how much of the window the cycle explained. That could be why the cycle helped little on ETTm1 and did not add to the Cross Transformer there.
+
+`--cycle-norm once` (`Signalformer(cycle_renorm=False)`) skips RevIN on the residual; `twice`, the round-15 behavior, stays the default so the earlier runs keep their meaning.
+
+| Variant | Question |
+|---|---|
+| `patch8_cycle_once` | Does one normalization, as in CycleNet, give a larger gain than round 15's `patch8_cycle` (ETTm1 0.380, ETTm2 0.277, Weather 0.250)? |
+| `cross_par_l0_cycle_once` | Does it let the cycle add to the Cross Transformer on ETTm1 and Weather (round 15: 0.380 and 0.246 against 0.377 and 0.248 without the cycle)? |
+
+ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720, input 96, 3 seeds: 72 runs. The references are the table of round 14.
+
+```bash
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 16
+```

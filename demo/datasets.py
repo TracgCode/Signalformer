@@ -140,7 +140,8 @@ def build_splits(
     }
 
 
-# FI-2010: 5 stocks over 10 trading days, one column per order book event. Rows 0-39 are the ask / bid prices and
+# FI-2010: 5 stocks over 10 trading days, one column per non-overlapping block of 10 order book events (so an
+# input of 96 columns spans about 960 events; DeepLOB's 100 columns about 1,000). Rows 0-39 are the ask / bid prices and
 # volumes of the 10 best levels (the default features), rows 40-143 the dataset's handcrafted features (spreads,
 # mid-prices, differences, means, accumulated differences, derivatives, intensities), rows 144-148 the labels for
 # the horizons below.

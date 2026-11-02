@@ -127,6 +127,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cycle-len", default="0",
                    help="residual cycle forecasting with a learnable cycle of this many steps per signal; 'daily' "
                    "uses one day of the dataset (ETTm 96, Weather 144, Traffic 24); 0 disables it")
+    p.add_argument("--cycle-norm", choices=("twice", "once"), default="twice",
+                   help="with --cycle-len: 'twice' lets RevIN normalize the residual again (round 15), 'once' "
+                   "normalizes each window only before the cycle is subtracted, as in CycleNet")
     p.add_argument("--tree-widths", default="",
                    help="comma-separated width per merge level (multiples of num_heads * 8); the last one repeats; "
                    "empty = d_model at every level")
@@ -462,6 +465,7 @@ def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.
         edge_gates=args.edge_gates,
         num_classes=num_classes,
         cycle_len=args.cycle_len,
+        cycle_renorm=args.cycle_norm == "twice",
     )
 
 

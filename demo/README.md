@@ -15,7 +15,7 @@ python demo/download_data.py
 | ETTm1, ETTm2 | 7 | 15 min | [zhouhaoyi/ETDataset](https://github.com/zhouhaoyi/ETDataset) | CC BY-ND 4.0 |
 | Weather | 21 | 10 min | Max Planck Institute for Biogeochemistry, Jena weather station; benchmark file from [Autoformer](https://github.com/thuml/Autoformer) | See the original provider |
 | Traffic | 862 | 1 hour | California Department of Transportation (PeMS); benchmark file from [Autoformer](https://github.com/thuml/Autoformer) | See the original provider |
-| FI-2010 | 40 | every order book event | Ntakaris et al., *Benchmark Dataset for Mid-Price Forecasting of Limit Order Book Data with Machine Learning Methods* (5 Nasdaq Nordic stocks, 10 days of June 2010); the DecPre files distributed with [DeepLOB](https://github.com/zcakhaa/DeepLOB-Deep-Convolutional-Neural-Networks-for-Limit-Order-Books) | CC BY 4.0 |
+| FI-2010 | 40 | every 10 order book events | Ntakaris et al., *Benchmark Dataset for Mid-Price Forecasting of Limit Order Book Data with Machine Learning Methods* (5 Nasdaq Nordic stocks, 10 days of June 2010); the DecPre files distributed with [DeepLOB](https://github.com/zcakhaa/DeepLOB-Deep-Convolutional-Neural-Networks-for-Limit-Order-Books) | CC BY 4.0 |
 
 Weather and Traffic are fetched from the Autoformer benchmark archive mirrored by [Nixtla datasetsforecast](https://nixtlaverse.nixtla.io/datasetsforecast/long_horizon.html). Check each provider's terms before redistributing the data or results derived from it.
 
@@ -43,7 +43,7 @@ FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 15: learnable cycle, 3 seeds
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 16: cycle normalized once, 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
@@ -53,7 +53,14 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 
 The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-Round 15, the default sweep (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+Round 16, the default sweep (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+
+| Variant | Change |
+|---|---|
+| `patch8_cycle_once` | `patch8_cycle` with `--cycle-norm once`: the window is normalized once, before the cycle is subtracted, and RevIN does not normalize the residual again (as in CycleNet) |
+| `cross_par_l0_cycle_once` | `cross_par_l0_cycle` with `--cycle-norm once` |
+
+Round 15 (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
 
 | Variant | Change |
 |---|---|

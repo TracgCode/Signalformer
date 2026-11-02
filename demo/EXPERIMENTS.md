@@ -558,7 +558,7 @@ Results, test MSE (Avg is the mean over the four horizons). The published rows a
 - Serial and parallel blocks still tie (averages within 0.002 on every dataset), so the parallel block stays the default Cross Transformer.
 - Nine runs failed at first because another process held 25.7 GB of the GPU, and the six Weather horizon-720 Cross Transformer runs were finished on a second machine. Its environment first had Python 3.15, where `torch.compile` is not supported: the three `cross_gate_l0_fast` runs ran with `--no-compile`, and the three `cross_par_l0` runs ran out of memory two at a time (about 21 GB each without compilation) and were run one at a time after a downgrade to Python 3.14, with compilation (the first resumed from its epoch-5 checkpoint). Compilation changes only speed and memory, not the results.
 
-## Round 15 (prepared, not run yet): a learnable daily cycle, and more dropout
+## Round 15: a learnable daily cycle, and more dropout (3 seeds)
 
 The models ahead of ours in round 14 share one ingredient: CycleNet, TQNet and PAMNet all model the periodic structure of the data explicitly. CycleNet's residual cycle forecasting is the simplest form: a learnable cycle of W steps per signal, indexed by the absolute time step modulo W, is subtracted from the normalized input window, the backbone forecasts the residual, and the cycle of the forecast steps is added back. It needs no new layers, only C x W parameters.
 
@@ -575,4 +575,47 @@ ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720, input 96, 3 seeds: 10
 ```bash
 python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 15
 ```
+
+Results, test MSE (Avg is the mean over the four horizons). `patch8` and `cross_par_l0` are the runs of rounds 13 and 14.
+
+| Dataset | Model | 96 | 192 | 336 | 720 | Avg |
+|---|---|---|---|---|---|---|
+| ETTm1 | *Naive (repeat last value)* | *1.214* | *1.261* | *1.287* | *1.322* | *1.271* |
+|  | *PatchTST (2023)* | *0.329* | *0.367* | *0.399* | *0.454* | *0.387* |
+|  | *CycleNet (2024)* | *0.319* | *0.360* | *0.389* | *0.447* | *0.379* |
+|  | *TQNet (2025)* | *0.311* | *0.356* | *0.390* | *0.452* | *0.377* |
+|  | *PAMNet (2026)* | ***0.308*** | ***0.353*** | ***0.375*** | ***0.425*** | ***0.365*** |
+| | `patch8` | 0.323 ± 0.007 | 0.371 ± 0.006 | 0.392 ± 0.001 | 0.452 ± 0.002 | 0.384 |
+| | `patch8_cycle` | 0.321 ± 0.004 | 0.361 ± 0.002 | 0.392 ± 0.002 | 0.446 ± 0.001 | 0.380 |
+| | `cross_par_l0` | 0.325 ± 0.005 | 0.358 ± 0.004 | 0.385 ± 0.001 | 0.441 ± 0.003 | 0.377 |
+| | `cross_par_l0_cycle` | 0.321 ± 0.001 | 0.364 ± 0.008 | 0.389 ± 0.008 | 0.447 ± 0.004 | 0.380 |
+| | `cross_par_l0_drop` | 0.320 ± 0.003 | 0.357 ± 0.005 | 0.385 ± 0.003 | 0.442 ± 0.001 | 0.376 |
+| ETTm2 | *Naive (repeat last value)* | *0.266* | *0.340* | *0.412* | *0.522* | *0.385* |
+|  | *PatchTST (2023)* | *0.175* | *0.241* | *0.305* | *0.402* | *0.281* |
+|  | *TQNet (2025)* | *0.173* | *0.238* | *0.301* | *0.397* | *0.277* |
+|  | *CycleNet (2024)* | ***0.163*** | *0.229* | ***0.284*** | *0.389* | *0.266* |
+|  | *PAMNet (2026)* | *0.165* | ***0.227*** | *0.285* | ***0.380*** | ***0.264*** |
+| | `patch8` | 0.182 ± 0.001 | 0.252 ± 0.001 | 0.322 ± 0.005 | 0.417 ± 0.002 | 0.293 |
+| | `patch8_cycle` | 0.166 ± 0.001 | 0.233 ± 0.002 | 0.302 ± 0.003 | 0.405 ± 0.003 | 0.277 |
+| | `cross_par_l0` | 0.181 ± 0.003 | 0.261 ± 0.008 | 0.341 ± 0.024 | 0.436 ± 0.015 | 0.305 |
+| | `cross_par_l0_cycle` | 0.169 ± 0.002 | 0.242 ± 0.008 | 0.304 ± 0.004 | 0.397 ± 0.008 | 0.278 |
+| | `cross_par_l0_drop` | 0.184 ± 0.003 | 0.258 ± 0.003 | 0.331 ± 0.009 | 0.439 ± 0.010 | 0.303 |
+| Weather | *Naive (repeat last value)* | *0.259* | *0.309* | *0.376* | *0.465* | *0.352* |
+|  | *PatchTST (2023)* | *0.177* | *0.225* | *0.278* | *0.354* | *0.259* |
+|  | *CycleNet (2024)* | *0.158* | *0.207* | *0.262* | *0.344* | *0.243* |
+|  | *TimeXer (2024)* | *0.157* | *0.204* | *0.261* | ***0.340*** | *0.241* |
+|  | *PAMNet (2026)* | ***0.154*** | ***0.202*** | ***0.260*** | *0.343* | ***0.240*** |
+| | `patch8` | 0.175 ± 0.001 | 0.223 ± 0.001 | 0.278 ± 0.000 | 0.357 ± 0.001 | 0.258 |
+| | `patch8_cycle` | 0.163 ± 0.001 | 0.213 ± 0.000 | 0.273 ± 0.001 | 0.351 ± 0.000 | 0.250 |
+| | `cross_par_l0` | 0.159 ± 0.003 | 0.210 ± 0.002 | 0.269 ± 0.002 | 0.352 ± 0.003 | 0.248 |
+| | `cross_par_l0_cycle` | 0.157 ± 0.001 | 0.210 ± 0.002 | 0.269 ± 0.002 | 0.349 ± 0.003 | 0.246 |
+| | `cross_par_l0_drop` | 0.161 ± 0.002 | 0.212 ± 0.002 | 0.272 ± 0.002 | 0.355 ± 0.003 | 0.250 |
+
+- The cycle helps most where the Cross Transformer did not: on ETTm2 it lowers `patch8` from 0.293 to 0.277 and `cross_par_l0` from 0.305 to 0.278, at every horizon. Both now tie TQNet (0.277), beat PatchTST (0.281) and are 0.003 behind TimeXer, but stay 0.011 to 0.014 behind CycleNet and PAMNet.
+- On ETTm2 the cycle also removes the long-horizon trouble of the Cross Transformer: at 720 its test MSE falls from 0.436 to 0.397 (the best of ours, level with TQNet's 0.397) and the seed spread from 0.015 to 0.008, while its training loss stays the same (0.50). So the cross blocks were not overfitting noise in general: without the cycle they fitted the daily pattern through the other signals, and that did not carry over to the test period.
+- On Weather the cycle and the exchange between the signals capture mostly the same structure: the cycle lowers `patch8` from 0.258 to 0.250, the cross blocks from 0.258 to 0.248, and both together reach 0.246, the same as the serial `cross_gate_l0_fast`. PAMNet, TimeXer, TQNet and CycleNet remain 0.003 to 0.006 ahead.
+- On ETTm1 the cycle helps channel independence a little (0.384 → 0.380) and the Cross Transformer not at all (0.377 → 0.380, within the seed spread at 192 and 336). The best of ours stays 0.376 to 0.377, level with TQNet, 0.012 behind PAMNet.
+- Dropout 0.3 does not fix ETTm2 (0.303 against 0.305 with 0.2) and changes nothing elsewhere (within 0.002). Dropout 0.2 stays the default.
+- Our cycle normalizes each window before subtracting the cycle and then runs the model's RevIN again on the residual; CycleNet runs RevIN only once. The second normalization may cost part of the gain where the cycle is weak relative to the residual; it is the first thing to test before adding the cycle to more variants.
+- Five Weather horizon-720 Cross Transformer runs ran out of memory two at a time (another user held 5.5 GB of the GPU) and were rerun one at a time.
 

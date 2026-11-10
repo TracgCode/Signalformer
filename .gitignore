@@ -24,6 +24,8 @@ htmlcov/
 
 # Third-party datasets have their own licenses; never commit them (fetch with demo/download_data.py)
 demo/data/
+# TWStock (fmt runs): private data, never commit or publish it
+/dataset/
 *.zip
 
 # Data and model artifacts

@@ -30,6 +30,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model import Signalformer  # noqa: E402
+from baselines import CycleNet, PAMNet  # noqa: E402
+from polyconv import PolyConv, PolyMLP  # noqa: E402
 from tree_model import PAIRINGS, TreeSignalformer, correlation_embedding, correlation_tree, random_tree  # noqa: E402
 
 from datasets import (  # noqa: E402
@@ -38,14 +40,18 @@ from datasets import (  # noqa: E402
     LOB_DATASETS,
     LOB_FEATURES,
     LOB_HORIZONS,
+    STOCK_DATASETS,
     TIME_FIELDS,
     ForecastWindows,
     LobWindows,
+    StockWindows,
     build_lob_splits,
     build_splits,
+    build_stock_splits,
 )
 
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
+BASELINES = ("cyclenet_linear", "cyclenet_mlp", "pamnet")  # reimplemented published models (baselines.py)
 
 # Per-dataset defaults; every value can be overridden on the command line. Models are kept small: the first
 # benchmark runs overfit within two or three epochs at d_model=64 with two encoder and two decoder layers.
@@ -56,9 +62,13 @@ PRESETS = {
     "Traffic": dict(d_model=64, encoder_layers=2, decoder_layers=1, dropout=0.1, batch_size=16, lr=5e-4),
     # 40 order book features; with channel independence a batch of 64 windows is 2560 sequences
     "FI2010": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=64, lr=1e-3),
+    # 100 stocks per window and about 1,000 training days: a batch of 16 days is 1,600 sequences
+    "TWStock": dict(d_model=32, encoder_layers=1, decoder_layers=1, dropout=0.2, batch_size=16, lr=1e-3),
 }
-# Steps per day, the period of --cycle-len daily
+# Steps per day, the period of --cycle-len daily; steps per week, the period of --cycle-len weekly (TWStock has one
+# step per weekday and no cycle within a day)
 DAILY_STEPS = {"ETTm1": 96, "ETTm2": 96, "Weather": 144, "Traffic": 24}
+WEEKLY_STEPS = {"TWStock": 5}
 # Channel independence (the default) runs every signal as its own sequence: Traffic needs smaller batches
 CI_PRESETS = {"Traffic": dict(batch_size=4)}
 
@@ -112,10 +122,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="with --ci-latents: normalize each latent over its window before the model")
     # tree: tree-merging architecture (tree_model.py); cross: Cross Transformer, channel-independent encoders and
     # a decoder in which every signal cross-attends to every signal's memory in signal order
-    p.add_argument("--architecture", choices=("signalformer", "tree", "cross"), default="signalformer")
+    # cyclenet_linear / cyclenet_mlp / pamnet: reimplemented published models (baselines.py), with --cycle-len;
+    # --d-model is the MLP hidden size of cyclenet_mlp and the embedding width of pamnet
+    p.add_argument("--architecture", choices=("signalformer", "tree", "cross", "polyconv", "polymlp", *BASELINES),
+                   default="signalformer")
     p.add_argument("--cross-parallel", action="store_true",
                    help="cross architecture: run the cross-attentions to all signals in parallel and merge them with "
                    "one projection, like the heads of multi-head attention, instead of one after another")
+    p.add_argument("--cross-fused", nargs="?", const="ffn", choices=("ffn", "mlp"),
+                   help="with --architecture cross: concatenate the encoded tokens of all signals at each position, "
+                   "project them to d_model ('ffn': C*d -> 4d -> d; 'mlp': one layer C*d -> d, then GELU), and let "
+                   "every signal's decoder cross-attend to that one memory")
+    p.add_argument("--fused-own", action="store_true",
+                   help="with --cross-fused: add each signal's own encoded tokens to the fused memory")
     p.add_argument("--edge-gates", nargs="?", const="l1", choices=("l1", "l0"),
                    help="cross architecture: learnable gate per (receiving, sending) signal pair, starting as the "
                    "identity (plain channel independence); l1 (the default) penalizes the gate values, l0 adds a "
@@ -127,6 +146,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cycle-len", default="0",
                    help="residual cycle forecasting with a learnable cycle of this many steps per signal; 'daily' "
                    "uses one day of the dataset (ETTm 96, Weather 144, Traffic 24); 0 disables it")
+    p.add_argument("--phase-edges", action="store_true",
+                   help="with --cycle-len, --cross-parallel and --edge-gates: add a learnable offset per phase "
+                   "(step modulo the cycle length) to the C x C edge gates, as TQNet's periodic queries")
+    p.add_argument("--cycle-harmonics", type=int, default=0,
+                   help="with --cycle-len: describe the cycle by this many harmonics of its period (frequency "
+                   "domain, evaluated at each step) instead of a table of values; every harmonic spans the same "
+                   "cycles as the table with -1. 0 keeps the table")
+    p.add_argument("--cycle-weekly", type=int, default=0,
+                   help="with --cycle-harmonics: add this many harmonics of a week (7 times the cycle length)")
+    p.add_argument("--phase-harmonics", type=int, default=0,
+                   help="with --phase-edges: describe the phase offsets of every edge by this many harmonics "
+                   "instead of a table of one offset per phase")
+    p.add_argument("--rot-conv", type=int, default=0,
+                   help="with --cycle-len: rotate the outputs of this many pairs of tokenizer filters by harmonics "
+                   "1..P of the time of day of each token (a kernel that turns with the phase); at most n_rank / 2")
+    p.add_argument("--rot-offsets", action="store_true",
+                   help="with --rot-conv: add a learnable angle per signal and filter pair")
+    p.add_argument("--carrier", choices=("none", "table", "fourier"), default="none",
+                   help="with --cycle-len: modulate the encoder memory with PAMNet's phase and amplitude carriers, "
+                   "a table of one carrier per phase or --carrier-harmonics harmonics")
+    p.add_argument("--carrier-harmonics", type=int, default=3, help="with --carrier fourier: harmonics of the day")
+    p.add_argument("--share-layers", action="store_true",
+                   help="adjacent pairs of encoder blocks and of decoder blocks share all their weights")
     p.add_argument("--cycle-norm", choices=("twice", "once"), default="twice",
                    help="with --cycle-len: 'twice' lets RevIN normalize the residual again (round 15), 'once' "
                    "normalizes each window only before the cycle is subtracted, as in CycleNet")
@@ -150,11 +192,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--gate-lambda", type=float, default=1e-2,
                    help="weight of the L0 gate penalty (expected fraction of open gates)")
+    p.add_argument("--poly-kernel", type=int, default=8, help="polyconv: length of the learnable filters")
+    p.add_argument("--poly-filters", type=int, default=2, help="polyconv: learnable filters per input feature")
+    p.add_argument("--poly-windows", default="5,10,20,40", help="polyconv: polynomial fit windows (steps)")
+    p.add_argument("--poly-degrees", default="0,1,2", help="polyconv: polynomial degrees")
+    p.add_argument("--poly-l2", type=float, default=1.0,
+                   help="polyconv: ridge penalty on the head weights, added to the mean training loss")
+    p.add_argument("--poly-readouts", default="next,slope,revert",
+                   help="polyconv: readout kinds of every polynomial fit (next, slope, revert)")
+    p.add_argument("--poly-sum-penalty", type=float, default=0.0,
+                   help="polyconv: penalty on (sum of each filter - 1)^2; > 0 also turns off the filter weight norm")
+    p.add_argument("--poly-deconv", choices=("", "target", "all"), default="",
+                   help="polyconv: forecast in the filtered domain and deconvolve (monic filters); the head reads "
+                        "the deconvolved forecasts of r only (target) or of every feature (all)")
+    p.add_argument("--poly-deconv-filter", choices=("monic", "norm", "monic_norm"), default="monic",
+                   help="polyconv --poly-deconv: last tap 1 (monic), the whole filter normalized (norm, divide by "
+                        "the last tap), or last tap 1 and the other taps normalized (monic_norm)")
+    p.add_argument("--poly-fixed", action="store_true",
+                   help="polyconv: keep the filters at their initial identity (no learnable convolution)")
+    p.add_argument("--mlp-window", type=int, default=5,
+                   help="polymlp: the last days of past residuals and features the MLP reads")
+    p.add_argument("--mlp-shrink", type=int, default=2, help="polymlp: hidden width = inputs / this")
+    p.add_argument("--mlp-diff", action="store_true",
+                   help="polymlp: day-to-day changes of the other features instead of their values")
+    p.add_argument("--residual-base", type=Path,
+                   help="TWStock: an .npz of fixed forecasts of r (demo/stock_poly.py --base) the model's output is "
+                        "added to, so the model learns their residual")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--optimizer", choices=("adamw", "muon"), default="adamw",
                    help="muon: Muon for the 2-D weights inside attention / FFN blocks, AdamW for the rest")
     p.add_argument("--muon-momentum", type=float, default=0.95)
-    p.add_argument("--scheduler", choices=("cosine", "onecycle"), default="cosine",
+    p.add_argument("--loss", choices=("mse", "hybrid_mae"), default="mse",
+                   help="hybrid_mae: (1 - alpha) * MAE + alpha * MAE of the forecasts' Fourier coefficients (as "
+                   "PAMNet, after FreDF), alpha = --freq-alpha")
+    p.add_argument("--freq-alpha", type=float, default=0.0)
+    p.add_argument("--precision", choices=("bf16", "fp32"), default="bf16", help="bf16 autocast where supported")
+    p.add_argument("--grad-clip", type=float, default=1.0, help="gradient norm clipping (0 = none)")
+    p.add_argument("--scheduler", choices=("cosine", "onecycle", "type3"), default="cosine",
                    help="cosine decays from the start; onecycle warms up for the first 10%% of steps")
     p.add_argument("--warmup", type=float,
                    help="cosine scheduler: linear warmup over this fraction of all steps (default 0.01 for FI2010, "
@@ -188,6 +262,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "and --raw-tokens")
     if args.architecture == "cross" and (args.shared or args.ci_latents != "0" or args.freq_tokens):
         p.error("the cross architecture is channel-independent and supports neither --ci-latents nor --freq-tokens")
+    if args.cross_fused and (args.architecture != "cross" or args.cross_parallel or args.edge_gates or args.raw_tokens):
+        p.error("--cross-fused requires --architecture cross, without --cross-parallel, --edge-gates or --raw-tokens")
+    if args.fused_own and not args.cross_fused:
+        p.error("--fused-own requires --cross-fused")
     if args.cross_parallel and args.architecture != "cross":
         p.error("--cross-parallel requires --architecture cross")
     if args.edge_gates and args.architecture != "cross":
@@ -200,7 +278,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.architecture == "tree" or args.time_features != "none":
             p.error("FI2010 supports neither the tree architecture nor time features")
     elif args.pred_len is None:
-        args.pred_len = 96
+        args.pred_len = 1 if args.dataset in STOCK_DATASETS else 96
+    if args.dataset in STOCK_DATASETS and (args.architecture in ("tree", "cyclenet_linear", "cyclenet_mlp")
+                                           or args.shared or args.ci_latents != "0" or args.freq_tokens
+                                           or args.raw_tokens or args.time_features != "none"):
+        p.error("TWStock supports the signalformer, cross and pamnet architectures with channel independence, "
+                "without --ci-latents, --freq-tokens, --raw-tokens or time features")
+    if args.architecture in ("polyconv", "polymlp") and args.dataset not in STOCK_DATASETS:
+        p.error(f"--architecture {args.architecture} is for TWStock")
+    if args.architecture == "polymlp" and args.residual_base is None:
+        p.error("--architecture polymlp forecasts the residual of --residual-base")
+    if args.residual_base is not None and args.dataset not in STOCK_DATASETS:
+        p.error("--residual-base is for TWStock")
+    if args.dataset in STOCK_DATASETS and args.loss != "mse":
+        p.error("TWStock is trained with the MSE of the returns (--loss mse)")
     if args.edge_lambda is None:
         args.edge_lambda = 1e-2 if args.edge_gates == "l0" else 1e-3
     if args.edge_mask_lr is None:
@@ -220,10 +311,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.dataset not in DAILY_STEPS:
             p.error(f"--cycle-len daily is not defined for {args.dataset}")
         args.cycle_len = DAILY_STEPS[args.dataset]
+    elif args.cycle_len == "weekly":
+        if args.dataset not in WEEKLY_STEPS:
+            p.error(f"--cycle-len weekly is not defined for {args.dataset}")
+        args.cycle_len = WEEKLY_STEPS[args.dataset]
     else:
         args.cycle_len = int(args.cycle_len)
+    if args.architecture in BASELINES and (not args.cycle_len or args.dataset in LOB_DATASETS):
+        p.error(f"--architecture {args.architecture} requires --cycle-len and a forecasting dataset")
     if args.cycle_len and (args.dataset in LOB_DATASETS or args.architecture == "tree"):
         p.error("--cycle-len applies to forecasting with the plain or cross architecture")
+    if (args.cycle_harmonics or args.cycle_weekly) and not args.cycle_len:
+        p.error("--cycle-harmonics and --cycle-weekly require --cycle-len")
+    if args.cycle_harmonics < 0:  # -1: every harmonic the period has (the same cycles as the table)
+        args.cycle_harmonics = args.cycle_len // 2
+    if args.cycle_weekly and not args.cycle_harmonics:
+        p.error("--cycle-weekly requires --cycle-harmonics")
+    if args.phase_harmonics and not args.phase_edges:
+        p.error("--phase-harmonics requires --phase-edges")
+    if args.phase_edges and not (args.cycle_len and args.cross_parallel and args.edge_gates):
+        p.error("--phase-edges requires --cycle-len, --cross-parallel and --edge-gates")
+    if (args.rot_conv or args.carrier != "none") and (not args.cycle_len or args.architecture not in ("signalformer", "cross")):
+        p.error("--rot-conv and --carrier require --cycle-len (for the phase) and the signalformer or cross architecture")
+    if args.rot_offsets and not args.rot_conv:
+        p.error("--rot-offsets requires --rot-conv")
+    if args.carrier != "none" and (args.shared or args.ci_latents != "0"):
+        p.error("--carrier requires channel independence without --ci-latents")
+    if args.share_layers and args.architecture == "tree":
+        p.error("--share-layers applies to the plain or cross architecture")
     presets = dict(PRESETS[args.dataset])
     if args.channel_independent:
         presets.update(CI_PRESETS.get(args.dataset, {}))
@@ -239,12 +354,13 @@ HEAD_DIM_MULTIPLE = 8  # FlashAttention kernels expect head widths that are mult
 def resolve_d_model(value, num_signals: int, num_heads: int) -> int:
     """'auto': twice the number of signals, clamped to [32, 256]; 'half': half the number of signals, at least
     32. Both are rounded up to a multiple of num_heads * 8. Every attention head then has a width that is a multiple of 8, which keeps the attention
-    on the FlashAttention kernel (and even, as RoPE requires). Explicit values must satisfy the same rule."""
+    on the FlashAttention kernel (and even, as RoPE requires). Explicit values only need an even head width (tiny
+    models such as d_model 4 with one head then run on the slower math kernel)."""
     step = HEAD_DIM_MULTIPLE * num_heads
     if str(value) not in ("auto", "half"):
         d_model = int(value)
-        if d_model % step != 0:
-            raise ValueError(f"d_model={d_model} must be a multiple of num_heads * {HEAD_DIM_MULTIPLE} = {step}")
+        if d_model % num_heads != 0 or (d_model // num_heads) % 2 != 0:
+            raise ValueError(f"d_model={d_model} must split into {num_heads} heads of an even width")
         return d_model
     width = min(max(2 * num_signals, 32), 256) if value == "auto" else max(-(-num_signals // 2), 32)
     return -(-width // step) * step
@@ -273,14 +389,20 @@ class DeviceWindows:
 
     Forecasting windows yield (x, y, t_in, t_out, phase) with y (B, C, pred_len) and phase (B,) the absolute time
     step of each window's first input step; classification windows (LobWindows) yield (x, y, None, None, None)
-    with y (B,) the class of the window's last event."""
+    with y (B,) the class of the window's last event. Stock windows (StockWindows) yield (x, y, None, None, phase)
+    with y (B, S, pred_len) the scaled returns of the S stocks, NaN where a stock did not trade. Every batch also
+    yields `base`, the fixed forecast (B, S, pred_len) the model's output is added to (--residual-base), or None."""
 
-    def __init__(self, windows: ForecastWindows | LobWindows, device: str, use_time: bool) -> None:
+    def __init__(self, windows: ForecastWindows | LobWindows | StockWindows, device: str, use_time: bool) -> None:
         self.values = windows.values.to(device)  # (C, T)
         self.times = windows.times.to(device) if use_time else None  # (T, time_dim)
         self.seq_len = windows.seq_len
         self.labels = windows.labels.to(device) if isinstance(windows, LobWindows) else None  # (T,)
-        self.starts = windows.starts.to(device) if isinstance(windows, LobWindows) else None  # (num_windows,)
+        self.starts = windows.starts.to(device) if isinstance(windows, (LobWindows, StockWindows)) else None
+        self.targets = windows.targets.to(device) if isinstance(windows, StockWindows) else None  # (S, T)
+        self.return_scale = getattr(windows, "return_scale", 1.0)  # scaled stock returns * this = returns
+        base = getattr(windows, "base", None)
+        self.base = None if base is None else base.to(device)  # (S, T) fixed forecast added to the model's
         span = windows.seq_len if self.labels is not None else windows.seq_len + windows.pred_len
         self.offsets = torch.arange(span, device=device)
         self.num_windows = len(windows)
@@ -292,13 +414,18 @@ class DeviceWindows:
         positions = starts[:, None] + self.offsets  # (B, span)
         segment = self.values[:, positions].permute(1, 0, 2)  # (B, C, span)
         if self.labels is not None:
-            return segment, self.labels[starts + self.seq_len - 1], None, None, None
+            return segment, self.labels[starts + self.seq_len - 1], None, None, None, None
         x, y = segment[..., : self.seq_len], segment[..., self.seq_len :]
+        base = None
+        if self.targets is not None:
+            y = self.targets[:, positions[:, self.seq_len :]].permute(1, 0, 2)  # (B, S, pred_len)
+            if self.base is not None:
+                base = self.base[:, positions[:, self.seq_len :]].permute(1, 0, 2)
         phase = starts + self.first
         if self.times is None:
-            return x, y, None, None, phase
+            return x, y, None, None, phase, base
         times = self.times[positions]  # (B, seq_len + pred_len, time_dim)
-        return x, y, times[:, : self.seq_len], times[:, self.seq_len :], phase
+        return x, y, times[:, : self.seq_len], times[:, self.seq_len :], phase, base
 
     def batches(
         self,
@@ -345,14 +472,16 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
     edges = [p for name, p in model.named_parameters() if name.endswith("edge_gate")]
     masks = [p for name, p in model.named_parameters() if name.endswith("edge_mask.log_alpha")]
     # The learnable cycle is a signal level, not a weight: no weight decay
-    cycle = [model.cycle] if getattr(model, "cycle", None) is not None else []
+    cycle = getattr(model, "cycle", None)
+    cycle = [] if cycle is None else [cycle] if isinstance(cycle, torch.nn.Parameter) else list(cycle.parameters())
     muon_params = []
     if args.optimizer == "muon":
         if isinstance(model, TreeSignalformer):
             blocks = list(model.merges)
         else:
             blocks = [*model.encoder.blocks, *model.decoder.blocks]
-        muon_params = [m.weight for b in blocks for m in b.modules() if isinstance(m, torch.nn.Linear)]
+        # dict.fromkeys drops the repeats of blocks shared by --share-layers
+        muon_params = list(dict.fromkeys(m.weight for b in blocks for m in b.modules() if isinstance(m, torch.nn.Linear)))
     special = {id(p) for p in [*muon_params, *gate, *pairing, *edges, *masks, *cycle]}
     adamw_params = [p for p in model.parameters() if id(p) not in special]
     groups = [{"params": adamw_params, "lr": args.lr, "weight_decay": args.weight_decay}]
@@ -379,28 +508,45 @@ def build_optimizers(model: "Signalformer | TreeSignalformer", args: argparse.Na
 def evaluate(forward, model, data: DeviceWindows, batch_size: int, autocast, subset: int = 0,
              max_steps: int | None = None) -> dict[str, Any]:
     """Forecasting: {"loss": MSE, "mse", "mae"}. Classification: {"loss": cross-entropy, "ce", "acc", "f1" (macro),
-    "confusion" (true class x predicted class)}."""
+    "confusion" (true class x predicted class)}. Stocks, over the days a stock traded: the forecasting metrics of the
+    scaled returns, plus "score" (the mean of (2 y_hat - 1) r with y_hat = [prediction > 0] and r the unscaled
+    return), "acc", "f1" (macro) and "confusion" of up (r > 0) against down or flat (rows the true class)."""
     model.eval()
     classify = data.labels is not None
     loss = torch.zeros((), device=data.device)
     ae = torch.zeros((), device=data.device)
-    confusion = torch.zeros(len(LOB_CLASSES), len(LOB_CLASSES), device=data.device)
+    updown = data.targets is not None
+    classes = 2 if updown else len(LOB_CLASSES)
+    confusion = torch.zeros(classes, classes, device=data.device)
+    gain = torch.zeros((), device=data.device)
     count = 0
-    for step, (x, y, t_in, t_out, phase) in enumerate(data.batches(batch_size, subset=subset)):
+    for step, (x, y, t_in, t_out, phase, base) in enumerate(data.batches(batch_size, subset=subset)):
         if max_steps is not None and step >= max_steps:
             break
         with autocast():
-            pred = forward(x, t_in, t_out, phase=phase) if getattr(model, "cycle", None) is not None else forward(x, t_in, t_out)
+            pred = forward(x, t_in, t_out, phase=phase) if takes_phase(model) else forward(x, t_in, t_out)
+        if base is not None:
+            pred = pred.float() + base  # the model forecasts the residual of the fixed forecast
         if classify:
             loss += torch.nn.functional.cross_entropy(pred.float(), y, reduction="sum")
             confusion.index_put_((y, pred.argmax(dim=1)), torch.ones_like(y, dtype=confusion.dtype), accumulate=True)
             count += y.numel()
+        elif updown:
+            valid = y.isfinite()  # stock days without trading have no target
+            r, guess = y[valid], pred.float()[valid]
+            up = guess > 0
+            gain += torch.where(up, r, -r).sum()
+            loss += (guess - r).pow(2).sum()
+            ae += (guess - r).abs().sum()
+            confusion.index_put_(((r > 0).long(), up.long()), torch.ones_like(r), accumulate=True)
+            count += valid.sum()
         else:
             err = pred.float() - y  # metrics in fp32
             loss += err.pow(2).sum()
             ae += err.abs().sum()
             count += err.numel()
-    if not classify:
+    count = int(count)
+    if not classify and not updown:
         mse = loss.item() / count  # one host sync per evaluation
         return dict(loss=mse, mse=mse, mae=ae.item() / count)
     confusion = confusion.cpu()
@@ -408,18 +554,57 @@ def evaluate(forward, model, data: DeviceWindows, batch_size: int, autocast, sub
     precision = tp / confusion.sum(dim=0).clamp(min=1)
     recall = tp / confusion.sum(dim=1).clamp(min=1)
     f1 = 2 * precision * recall / (precision + recall).clamp(min=1e-12)
+    if updown:
+        mse = loss.item() / count
+        return dict(loss=mse, mse=mse, mae=ae.item() / count, score=gain.item() / count * data.return_scale,
+                    acc=(tp.sum() / count).item(), f1=f1.mean().item(), confusion=confusion.tolist())
     ce = loss.item() / count
     return dict(loss=ce, ce=ce, acc=(tp.sum() / count).item(), f1=f1.mean().item(), confusion=confusion.tolist())
 
 
 def describe(metrics: dict[str, Any]) -> str:
+    if "score" in metrics:
+        return (f"mse {metrics['mse']:.4f}  score {metrics['score'] * 1e4:.2f} bp  acc {metrics['acc']:.4f} "
+                f"f1 {metrics['f1']:.4f}")
     if "f1" in metrics:
         return f"ce {metrics['ce']:.4f} acc {metrics['acc']:.4f} f1 {metrics['f1']:.4f}"
     return f"mse {metrics['mse']:.4f} mae {metrics['mae']:.4f}"
 
 
+def takes_phase(model: torch.nn.Module) -> bool:
+    """Whether the model needs each window's absolute time step (a learnable cycle, or a baseline's carriers)."""
+    return getattr(model, "cycle", None) is not None or getattr(model, "uses_phase", False)
+
+
+def forecast_loss(pred: torch.Tensor, y: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    """Per-window training loss of (B, C, H) forecasts: MSE, or PAMNet's hybrid MAE in time and frequency."""
+    if args.loss == "mse":
+        # stock targets are NaN on days a stock did not trade: the mean over the valid ones
+        valid = y.isfinite()
+        err = torch.where(valid, pred - y, 0.0)
+        return err.pow(2).sum(dim=(1, 2)) / valid.sum(dim=(1, 2)).clamp(min=1)
+    time_mae = (pred - y).abs().mean(dim=(1, 2))
+    freq_mae = (torch.fft.rfft(pred, dim=-1) - torch.fft.rfft(y, dim=-1)).abs().mean(dim=(1, 2))
+    return (1 - args.freq_alpha) * time_mae + args.freq_alpha * freq_mae
+
+
 def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.Tensor, num_classes: int = 0):
     """Signalformer, or TreeSignalformer with its pairing tree computed from the training split only."""
+    if args.architecture in ("cyclenet_linear", "cyclenet_mlp"):
+        hidden = args.d_model if args.architecture == "cyclenet_mlp" else 0
+        return CycleNet(num_signals, args.seq_len, args.pred_len, args.cycle_len, hidden=hidden)
+    if args.architecture == "polymlp":
+        return PolyMLP(num_signals, args.signal_features, args.pred_len, args.mlp_window, args.dropout, args.mlp_diff,
+                       args.mlp_shrink)
+    if args.architecture == "polyconv":
+        ints = lambda v: tuple(int(a) for a in v.split(","))
+        return PolyConv(num_signals, args.signal_features, args.seq_len, args.pred_len, args.poly_kernel,
+                        args.poly_filters, ints(args.poly_windows), ints(args.poly_degrees), args.poly_fixed,
+                        args.poly_l2, tuple(args.poly_readouts.split(",")), args.poly_sum_penalty,
+                        args.poly_deconv, args.poly_deconv_filter)
+    if args.architecture == "pamnet":
+        return PAMNet(num_signals, args.seq_len, args.pred_len, args.cycle_len, args.d_model, args.dropout,
+                      signal_features=getattr(args, "signal_features", 1))
     common: dict[str, Any] = dict(
         in_channels=num_signals,
         in_len=args.seq_len,
@@ -462,10 +647,22 @@ def build_model(args: argparse.Namespace, num_signals: int, train_values: torch.
         raw_tokens=args.raw_tokens,
         cross_decoder=args.architecture == "cross",
         cross_parallel=args.cross_parallel,
+        cross_fused=args.cross_fused or False,
+        fused_own=args.fused_own,
         edge_gates=args.edge_gates,
         num_classes=num_classes,
         cycle_len=args.cycle_len,
         cycle_renorm=args.cycle_norm == "twice",
+        phase_edges=args.phase_edges,
+        share_layers=args.share_layers,
+        cycle_harmonics=args.cycle_harmonics,
+        cycle_weekly=args.cycle_weekly,
+        phase_harmonics=args.phase_harmonics,
+        rot_conv=args.rot_conv,
+        rot_offsets=args.rot_offsets,
+        carrier="" if args.carrier == "none" else args.carrier,
+        carrier_harmonics=args.carrier_harmonics if args.carrier == "fourier" else 0,
+        signal_features=getattr(args, "signal_features", 1),
     )
 
 
@@ -478,9 +675,16 @@ def main() -> None:
     classify = args.dataset in LOB_DATASETS
     if classify:
         splits = build_lob_splits(args.seq_len, args.pred_len, features=args.lob_features)
+    elif args.dataset in STOCK_DATASETS:
+        splits = build_stock_splits(args.seq_len, args.pred_len, args.residual_base,
+                                    base_feature=args.architecture == "polymlp")
     else:
         splits = build_splits(args.dataset, args.seq_len, args.pred_len, args.time_fields)
     num_signals = splits["train"].values.size(0)
+    if args.dataset in STOCK_DATASETS:
+        # one signal per stock, each with its features
+        args.signal_features = splits["train"].num_features
+        num_signals //= args.signal_features
     args.d_model = resolve_d_model(args.d_model, num_signals, args.num_heads)
     args.ci_latents = resolve_ci_latents(args.ci_latents, num_signals)
     use_time = len(args.time_fields) > 0
@@ -515,6 +719,11 @@ def main() -> None:
             schedulers.append(torch.optim.lr_scheduler.OneCycleLR(
                 optimizer, max_lr=max_lr, total_steps=total_steps, pct_start=0.1
             ))
+        elif args.scheduler == "type3":
+            # the CycleNet / TQNet code's 'type3': the full rate for 3 epochs, then x 0.8 every epoch
+            schedulers.append(torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lambda step: 0.8 ** max(0, step // steps_per_epoch - 2)
+            ))
         else:
             warmup_steps = round(args.warmup * total_steps)
             cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps))
@@ -525,7 +734,7 @@ def main() -> None:
     if len(optimizers) > 1:
         print(f"muon: {sum(p.numel() for p in optimizers[1].param_groups[0]['params']):,} parameters")
     # bf16 autocast on GPUs that support it; no GradScaler needed
-    use_bf16 = args.device == "cuda" and torch.cuda.is_bf16_supported()
+    use_bf16 = args.device == "cuda" and torch.cuda.is_bf16_supported() and args.precision == "bf16"
 
     def autocast():
         return torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16)
@@ -583,7 +792,7 @@ def main() -> None:
             order, first, total = train.window_order(shuffle=True), 0, torch.zeros((), device=args.device)
         interval, interval_steps = torch.zeros((), device=args.device), 0
         batches = train.batches(args.batch_size, drop_last=True, order=order, start=first)
-        for step, (x, y, t_in, t_out, phase) in enumerate(batches, start=first):
+        for step, (x, y, t_in, t_out, phase, base) in enumerate(batches, start=first):
             if step >= steps_per_epoch:
                 break
             for optimizer in optimizers:
@@ -593,13 +802,17 @@ def main() -> None:
                 progress = global_step / max(1, total_steps - 1)
                 tree_model.pair_temperature = temp_start + (temp_end - temp_start) * progress
             with autocast():
-                pred = forward(x, t_in, t_out, phase=phase) if getattr(model, "cycle", None) is not None else forward(x, t_in, t_out)
+                pred = forward(x, t_in, t_out, phase=phase) if takes_phase(model) else forward(x, t_in, t_out)
                 if classify:
                     sample_loss = torch.nn.functional.cross_entropy(pred.float(), y, reduction="none")  # (B,)
                 else:
-                    sample_loss = (pred.float() - y).pow(2).mean(dim=(1, 2))  # (B,)
+                    if base is not None:
+                        pred = pred.float() + base  # the model forecasts the residual of the fixed forecast
+                    sample_loss = forecast_loss(pred.float(), y, args)  # (B,)
                 task_loss = sample_loss.mean()
                 loss = task_loss + args.gate_lambda * model.penalty()
+                if isinstance(model, PolyConv):
+                    loss = loss + model.ridge_penalty()
                 if args.edge_gates:
                     loss = loss + args.edge_lambda * model.edge_penalty()
             if tree_model is not None and tree_model.pairing == "soft":
@@ -612,7 +825,7 @@ def main() -> None:
                 baseline = (b.sum() - b) / max(1, b.numel() - 1)
                 loss = loss + ((b - baseline) * tree_model.last_log_prob).mean()
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip or math.inf)
             lr = optimizers[0].param_groups[0]["lr"]
             for optimizer, scheduler in zip(optimizers, schedulers):
                 optimizer.step()
@@ -680,6 +893,7 @@ def main() -> None:
         history=history, steps=step_log, gate_values=gate.gate_values().tolist() if gate else [],
         tree=tree_model.tree if tree_model is not None else None,
         edge_gates=[w.tolist() for w in model.edge_weights()] if args.edge_gates else None,
+        polyconv=model.report() if isinstance(model, PolyConv) else None,
     ), indent=2))
     print(f"saved {out}")
     if checkpoint is not None:

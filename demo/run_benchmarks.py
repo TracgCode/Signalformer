@@ -34,14 +34,14 @@ from pathlib import Path
 
 import torch
 
-from datasets import LOB_DATASETS, build_lob_splits, build_splits, num_signals
+from datasets import LOB_DATASETS, STOCK_DATASETS, build_lob_splits, build_splits, build_stock_splits, num_signals
 from train import effective_config
 from train import parse_args as parse_train_args
 
 DEMO_DIR = Path(__file__).resolve().parent
 OUT_DIR = DEMO_DIR / "runs" / "benchmark"
 
-DATASETS = ("ETTm1", "ETTm2", "Weather", "Traffic", "FI2010")
+DATASETS = ("ETTm1", "ETTm2", "Weather", "Traffic", "FI2010", "TWStock")
 # Small datasets with many signals per window: where the Cross Transformer variants run
 CROSS_DATASETS = ("ETTm1", "ETTm2", "Weather", "FI2010")
 
@@ -56,6 +56,98 @@ DATASET_ARGS = {
 SHARED = ["--shared", "--no-raw-skip"]
 # Patching with one token per 8 steps (kernel 16, rank 8), the best tokenizer of round 6
 PATCH8 = ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8"]
+ROUND23 = {"rotconv": ["--rot-conv", "4"], "rotconv_half": ["--rot-conv", "2"],
+           "rotconv_sig": ["--rot-conv", "4", "--rot-offsets"], "pamod": ["--carrier", "fourier", "--carrier-harmonics", "3"],
+           "pamod_table": ["--carrier", "table"]}
+# fmt run 1 (TWStock): PAMNet and each dataset's best model, moved to a weekly cycle (5 weekdays; the data has one
+# step per day). A period of 5 has 2 harmonics, so the 3- and 4-harmonic settings of the forecasting models become 2
+# (all the harmonics) and the ETTm2 and Weather models become the same configuration. All train with the MSE of the
+# next-day returns. PAMNet keeps its own recipe (as in the baselines), our models the TWStock defaults.
+FMT_RUN1 = {
+    "fmt_pamnet": ["--architecture", "pamnet", "--cycle-len", "weekly", "--epochs", "30", "--patience", "5",
+                   "--val-windows", "0", "--weight-decay", "0", "--scheduler", "type3", "--precision", "fp32",
+                   "--grad-clip", "0", "--lr", "0.005", "--d-model", "32", "--dropout", "0.1"],
+    "fmt_ettm1_best": ["--architecture", "cross", "--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8",
+                       "--cross-parallel", "--edge-gates", "l0", "--cycle-len", "weekly", "--cycle-harmonics", "-1",
+                       "--phase-edges", "--phase-harmonics", "2"],
+    "fmt_ettm2_best": ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8", "--cycle-len", "weekly",
+                       "--cycle-norm", "once", "--cycle-harmonics", "-1"],
+    "fmt_weather_best": ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "8", "--cycle-len", "weekly",
+                         "--cycle-norm", "once", "--cycle-harmonics", "2"],
+    "fmt_fi2010_best": ["--kernel-size", "16", "--conv-stride", "8", "--n-rank", "16", "--front-end", "none"],
+}
+# fmt run 7: the ridge on the multi-window polynomial features (demo/stock_poly.py --base) as a fixed forecast the
+# model's output is added to, so the model learns its residual
+RIDGE_BASE = ["--residual-base", str(Path(__file__).resolve().parent / "runs" / "twstock_ridge_base.npz")]
+# fmt run 8: PolyConv (polyconv.py), learnable filters in front of the polynomial fits, against the fixed identity
+# filters, over the ridge penalty, the readouts (all, or only the level-free slope and reversion), the filter length
+# and count, and as the residual of the polynomial ridge
+FMT_POLYCONV = ["--architecture", "polyconv", "--epochs", "40"]
+FMT_RUN8 = {
+    "fmt_polyconv": FMT_POLYCONV,
+    "fmt_polyconv_l2_0.1": [*FMT_POLYCONV, "--poly-l2", "0.1"],
+    "fmt_polyconv_l2_10": [*FMT_POLYCONV, "--poly-l2", "10"],
+    "fmt_polyconv_inv": [*FMT_POLYCONV, "--poly-readouts", "slope,revert"],
+    "fmt_polyconv_fixed": [*FMT_POLYCONV, "--poly-fixed", "--poly-filters", "1"],
+    "fmt_polyconv_fixed_inv": [*FMT_POLYCONV, "--poly-fixed", "--poly-filters", "1", "--poly-readouts", "slope,revert"],
+    "fmt_polyconv_k4": [*FMT_POLYCONV, "--poly-kernel", "4"],
+    "fmt_polyconv_k16": [*FMT_POLYCONV, "--poly-kernel", "16"],
+    "fmt_polyconv_m1": [*FMT_POLYCONV, "--poly-filters", "1"],
+    "fmt_polyconv_m4": [*FMT_POLYCONV, "--poly-filters", "4"],
+    "fmt_polyconv_res": [*FMT_POLYCONV, *RIDGE_BASE],
+    "fmt_polyconv_fixed_res": [*FMT_POLYCONV, "--poly-fixed", "--poly-filters", "1", *RIDGE_BASE],
+    # the filter sums held near 1 by a penalty instead of the weight norm
+    **{f"fmt_polyconv_sum{lam}": [*FMT_POLYCONV, "--poly-sum-penalty", lam] for lam in ("0.01", "0.1", "1")},
+    "fmt_polyconv_sum0.1_inv": [*FMT_POLYCONV, "--poly-sum-penalty", "0.1", "--poly-readouts", "slope,revert"],
+    "fmt_polyconv_sum0.1_res": [*FMT_POLYCONV, "--poly-sum-penalty", "0.1", *RIDGE_BASE],
+}
+# fmt run 9: PolyConv forecasting in the filtered domain and deconvolving back (--poly-deconv)
+FMT_DECONV = [*FMT_POLYCONV, "--poly-deconv", "target"]
+FMT_RUN9 = {
+    "fmt_deconv_r": FMT_DECONV,
+    "fmt_deconv_r_fixed": [*FMT_DECONV, "--poly-fixed", "--poly-filters", "1"],
+    "fmt_deconv_r_k2": [*FMT_DECONV, "--poly-kernel", "2"],
+    "fmt_deconv_r_k16": [*FMT_DECONV, "--poly-kernel", "16"],
+    "fmt_deconv_r_m4": [*FMT_DECONV, "--poly-filters", "4"],
+    "fmt_deconv_r_sum0.1": [*FMT_DECONV, "--poly-sum-penalty", "0.1"],
+    "fmt_deconv_r_res": [*FMT_DECONV, *RIDGE_BASE],
+    "fmt_deconv_all": [*FMT_POLYCONV, "--poly-deconv", "all"],
+    "fmt_deconv_all_fixed": [*FMT_POLYCONV, "--poly-deconv", "all", "--poly-fixed", "--poly-filters", "1"],
+}
+# fmt run 10: the deconvolving PolyConv with the weight-normalized filter (dividing by its last tap) or the monic
+# filter with normalized free taps, against the free monic filter of fmt run 9, at polynomial degrees up to 2, 4, 6
+DEGREES = {"d2": "0,1,2", "d4": "0,1,2,3,4", "d6": "0,1,2,3,4,5,6"}
+FMT_RUN10 = {
+    **{f"fmt_deconv_r_{filt}_{d}": [*FMT_DECONV, "--poly-deconv-filter", filt, "--poly-degrees", deg]
+       for filt in ("norm", "monic_norm", "monic") for d, deg in DEGREES.items()},
+    **{f"fmt_deconv_{what}_{filt}_d4": [*FMT_POLYCONV, "--poly-deconv", "target" if what == "r_res" else "all",
+                                        "--poly-deconv-filter", filt, "--poly-degrees", DEGREES["d4"],
+                                        *(RIDGE_BASE if what == "r_res" else [])]
+       for what in ("r_res", "all") for filt in ("norm", "monic_norm")},
+}
+# fmt run 11: the polynomial ridge plus a two-layer MLP forecasting its residual from the last w days of past
+# residuals and of the other features (polyconv.PolyMLP), w = 5, 10, 20, with the feature values or their changes
+FMT_POLYMLP = ["--architecture", "polymlp", "--epochs", "40", *RIDGE_BASE]
+FMT_RUN11 = {
+    **{f"fmt_polymlp_w{w}": [*FMT_POLYMLP, "--mlp-window", str(w)] for w in (5, 10, 20)},
+    **{f"fmt_polymlp_w{w}_diff": [*FMT_POLYMLP, "--mlp-window", str(w), "--mlp-diff"] for w in (5, 10, 20)},
+    # fmt run 12: the hidden layer cut to a quarter of the inputs
+    **{f"fmt_polymlp_w{w}_diff_h4": [*FMT_POLYMLP, "--mlp-window", str(w), "--mlp-diff", "--mlp-shrink", "4"]
+       for w in (5, 10, 20)},
+    "fmt_polymlp_w5_h4": [*FMT_POLYMLP, "--mlp-window", "5", "--mlp-shrink", "4"],
+}
+# fmt run 5: the capacity ladder, each step on top of the previous one (all without the encoder)
+FMT_CUTS = (
+    ["--d-model", "8", "--num-heads", "2", "--n-rank", "4"],
+    ["--d-model", "8", "--num-heads", "2", "--n-rank", "2", "--no-raw-skip"],
+    ["--d-model", "4", "--num-heads", "1", "--n-rank", "2", "--no-raw-skip"],
+    ["--d-model", "4", "--num-heads", "1", "--n-rank", "1", "--no-raw-skip", "--kernel-size", "8"],
+    ["--d-model", "2", "--num-heads", "1", "--n-rank", "1", "--no-raw-skip", "--kernel-size", "8"],
+)
+PAMNET_TRAINING = ["--batch-size", "256", "--epochs", "30", "--patience", "5", "--val-windows", "0",
+                   "--weight-decay", "0", "--scheduler", "type3", "--lr", "0.005"]
+BASELINE_TRAINING = ["--cycle-len", "daily", "--batch-size", "256", "--epochs", "30", "--patience", "5", "--val-windows", "0",
+                     "--weight-decay", "0", "--scheduler", "type3", "--precision", "fp32", "--grad-clip", "0"]
 # Patching without the moving-average bands: one band, so the rank doubles to 16 to keep the width
 NO_MA = [*PATCH8[:-1], "16", "--front-end", "none"]
 VARIANTS = {
@@ -170,14 +262,179 @@ VARIANTS = {
     "patch8_cycle_once": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once"],
     "cross_par_l0_cycle_once": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
                                 "--cycle-len", "daily", "--cycle-norm", "once"],
+    # Round 17, on the round-15 cycle Cross Transformer: edge weights that depend on the time of day (as TQNet's
+    # periodic queries), and two layers with or without shared weights (regularization by sharing)
+    "cross_par_l0_cycle_pedge": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                 "--cycle-len", "daily", "--phase-edges"],
+    "cross_par_l0_cycle_e2d2": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                "--cycle-len", "daily", "--encoder-layers", "2", "--decoder-layers", "2"],
+    "cross_par_l0_cycle_e2d2_shared": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                       "--cycle-len", "daily", "--encoder-layers", "2", "--decoder-layers", "2",
+                                       "--share-layers"],
+    # Round 18: the cycle described in the frequency domain (Fourier coefficients evaluated at each step)
+    "patch8_cycle_once_fourier_full": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "-1"],
+    "patch8_cycle_once_fourier_k8": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "8"],
+    "patch8_cycle_once_fourier_k3": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "3"],
+    "patch8_cycle_once_fourier_k8_weekly": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once",
+                                            "--cycle-harmonics", "8", "--cycle-weekly", "8"],
+    "cross_par_l0_cycle_pedge_fourier": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                         "--cycle-len", "daily", "--phase-edges", "--phase-harmonics", "4"],
+    # Round 18: one fused memory (concatenated signals -> FFN -> d_model) instead of the complete graph
+    "cross_fused_cycle": ["--architecture", "cross", *PATCH8, "--cross-fused", "ffn", "--cycle-len", "daily"],
+    "cross_fused_mlp_cycle": ["--architecture", "cross", *PATCH8, "--cross-fused", "mlp", "--cycle-len", "daily"],
+    # Round 19: the frequency-domain cycle in the Cross Transformer, and the fused memory plus each signal's own tokens
+    "cross_par_l0_cycle_fourier_full": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                        "--cycle-len", "daily", "--cycle-harmonics", "-1"],
+    "cross_par_l0_cycle_fourier_k3": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                      "--cycle-len", "daily", "--cycle-harmonics", "3"],
+    "cross_par_l0_cycle_pedge_fourier_k3": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                            "--cycle-len", "daily", "--cycle-harmonics", "3", "--phase-edges",
+                                            "--phase-harmonics", "4"],
+    "cross_fused_own_mlp_cycle": ["--architecture", "cross", *PATCH8, "--cross-fused", "mlp", "--fused-own",
+                                  "--cycle-len", "daily"],
+    # Round 21: our best model per dataset with PAMNet's training recipe, split into its loss and its schedule.
+    # _hmae: PAMNet's hybrid MAE in time and frequency (its alpha for the dataset); _ptrain: Adam without weight
+    # decay, batch 256, up to 30 epochs with patience 5 on the full validation split, 'type3' decay, lr 0.005;
+    # _precipe: both; round 22: _precipe_lr0.001 / _precipe_lr0.002, both at a lower lr (the last --lr wins)
+    **{f"{name}_{suffix}": [*args, *extra]
+       for name, args, alpha in (
+           ("cross_par_l0_cycle_pedge_fourier_k3",
+            ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0", "--cycle-len", "daily",
+             "--cycle-harmonics", "3", "--phase-edges", "--phase-harmonics", "4"], "0.05"),
+           ("patch8_cycle_once_fourier_full",
+            [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "-1"], "0.35"),
+           ("patch8_cycle_once_fourier_k3",
+            [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "3"], "0.2"))
+       for suffix, extra in (
+           ("hmae", ["--loss", "hybrid_mae", "--freq-alpha", alpha]),
+           ("ptrain", PAMNET_TRAINING),
+           ("precipe", [*PAMNET_TRAINING, "--loss", "hybrid_mae", "--freq-alpha", alpha]),
+           *((f"precipe_lr{lr}", [*PAMNET_TRAINING, "--loss", "hybrid_mae", "--freq-alpha", alpha, "--lr", lr])
+             for lr in ("0.001", "0.002")))},
+    # Round 23: phase-dependent features on each dataset's best model and recipe. _rotconv: the tokenizer kernel turns
+    # with the time of day of each token (4 filter pairs, harmonics 1-4); _rotconv_half: 2 pairs, the other filters
+    # stay fixed; _rotconv_sig: 4 pairs plus a learnable angle per signal; _pamod: PAMNet's phase and amplitude
+    # carriers on the encoder memory, 3 harmonics of the day; _pamod_table: a table of carriers, as PAMNet
+    **{f"{name}_{suffix}": [*args, *extra]
+       for name, args in (
+           ("cross_par_l0_cycle_pedge_fourier_k3_precipe",
+            ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0", "--cycle-len", "daily",
+             "--cycle-harmonics", "3", "--phase-edges", "--phase-harmonics", "4", *PAMNET_TRAINING,
+             "--loss", "hybrid_mae", "--freq-alpha", "0.05"]),
+           ("patch8_cycle_once_fourier_full_precipe_lr0.002",
+            [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "-1", *PAMNET_TRAINING,
+             "--loss", "hybrid_mae", "--freq-alpha", "0.35", "--lr", "0.002"]),
+           ("patch8_cycle_once_fourier_k3",
+            [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once", "--cycle-harmonics", "3"]))
+       for suffix, extra in ROUND23.items()},
+    # Weather: the base model as wide as _pamod_table (d_model 64: 143k-183k parameters against 147k-167k)
+    **FMT_RUN1,
+    # fmt run 2: our best models without the encoder's self-attention blocks (the tokens go through the final RMSNorm
+    # straight to the decoder's cross-attention), against the overfitting of fmt run 1
+    **{f"{name}_noenc": [*FMT_RUN1[name], "--encoder-layers", "0"]
+       for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    # d_model 32 / 8 = 4 (one attention head of width 4), stopped after 2 runs in favour of d_model 16
+    **{f"{name}_d4": [*FMT_RUN1[name], "--d-model", "4", "--num-heads", "1"]
+       for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    # fmt run 3: our best models with d_model 16 instead of 32 (4 heads of width 4)
+    **{f"{name}_d16": [*FMT_RUN1[name], "--d-model", "16"]
+       for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    # fmt run 4: no encoder and d_model 16 together; and the original models with fewer tokenizer filters per feature
+    # (n_rank halved and quartered: 8 -> 4 / 2, FI-2010's 16 -> 8 / 4); the last --n-rank wins
+    **{f"{name}_noenc_d16": [*FMT_RUN1[name], "--encoder-layers", "0", "--d-model", "16"]
+       for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    **{f"{name}_rank{rank}": [*FMT_RUN1[name], "--n-rank", str(rank)]
+       for name, ranks in (("fmt_ettm1_best", (4, 2)), ("fmt_ettm2_best", (4, 2)), ("fmt_fi2010_best", (8, 4)))
+       for rank in ranks},
+    # and all three together: no encoder, d_model 16 and fewer filters
+    **{f"{name}_noenc_d16_rank{rank}": [*FMT_RUN1[name], "--encoder-layers", "0", "--d-model", "16", "--n-rank", str(rank)]
+       for name, ranks in (("fmt_ettm1_best", (4, 2)), ("fmt_ettm2_best", (4, 2)), ("fmt_fi2010_best", (8, 4)))
+       for rank in ranks},
+    # fmt run 5: a capacity ladder down from no encoder, to find how small the model has to be before the validation
+    # MSE stops rising after the first epochs; the steps cut d_model, the filters per feature, the raw skip and the
+    # kernel length (on the FI-2010 model without a cycle and on the ETTm2 model with the weekly cycle)
+    **{f"{name}_cut{i}": [*FMT_RUN1[name], "--encoder-layers", "0", *cut]
+       for name in ("fmt_ettm2_best", "fmt_fi2010_best") for i, cut in enumerate(FMT_CUTS, start=1)},
+    # fmt run 6: the same ladder with up to 40 epochs instead of 10 (patience 3), since the models below ~3k
+    # parameters were still improving on validation at epoch 10
+    **{f"{name}_cut{i}_e40": [*FMT_RUN1[name], "--encoder-layers", "0", *cut, "--epochs", "40"]
+       for name in ("fmt_ettm2_best", "fmt_fi2010_best") for i, cut in enumerate(FMT_CUTS, start=1)},
+    **FMT_RUN8,
+    **FMT_RUN9,
+    **FMT_RUN10,
+    **FMT_RUN11,
+    # fmt run 7: every fmt run 1 model and the fmt run 6 ladder, learning the residual of the polynomial ridge
+    **{f"{name}_res": [*args, *RIDGE_BASE] for name, args in FMT_RUN1.items()},
+    **{f"{name}_cut{i}_e40_res": [*FMT_RUN1[name], "--encoder-layers", "0", *cut, "--epochs", "40", *RIDGE_BASE]
+       for name in ("fmt_ettm2_best", "fmt_fi2010_best") for i, cut in enumerate(FMT_CUTS, start=1)},
+    "patch8_cycle_once_fourier_k3_d64": [*PATCH8, "--cycle-len", "daily", "--cycle-norm", "once",
+                                         "--cycle-harmonics", "3", "--d-model", "64"],
+    # Baselines: published models reimplemented in baselines.py, trained with their own published settings
+    # (Adam, batch 256, 30 epochs, patience 5 on the full validation split, 'type3' decay, fp32, no clipping)
+    # and sized like our models (~10k-100k parameters)
+    "cyclenet_linear": ["--architecture", "cyclenet_linear", *BASELINE_TRAINING, "--lr", "0.01"],
+    "cyclenet_mlp128": ["--architecture", "cyclenet_mlp", *BASELINE_TRAINING, "--lr", "0.005", "--d-model", "128"],
+    # PAMNet, d = 32 instead of the paper's 512; lr and the frequency-loss weight alpha are chosen on validation
+    **{f"pamnet_lr{lr}_a{a}": ["--architecture", "pamnet", *BASELINE_TRAINING, "--d-model", "32", "--dropout", "0.5",
+                               "--loss", "hybrid_mae", "--lr", lr, "--freq-alpha", a]
+       for lr in ("0.001", "0.005") for a in ("0.05", "0.2", "0.35")},
+    # d = 32 with the paper's dropout 0.5 may underfit: the same with dropout 0.1 (alpha 0.2), horizon 96 only
+    # The PAMNet reference: dropout 0.1 (0.5 underfits at d = 32: ETTm1 96 validation MSE 0.391 against 0.358),
+    # lr 0.005 and the alpha chosen on validation for each dataset
+    **{f"pamnet_d32_a{a}": ["--architecture", "pamnet", *BASELINE_TRAINING, "--d-model", "32", "--dropout", "0.1",
+                            "--loss", "hybrid_mae", "--lr", "0.005", "--freq-alpha", a] for a in ("0.05", "0.2", "0.35")},
+    "pamnet_lr0.005_a0.2_drop0.1": ["--architecture", "pamnet", *BASELINE_TRAINING, "--d-model", "32", "--dropout", "0.1",
+                                    "--loss", "hybrid_mae", "--lr", "0.005", "--freq-alpha", "0.2"],
+    # Round 20: the number of harmonics of the phase-dependent edges, with the 3-harmonic cycle
+    "cross_par_l0_cycle_pedge2_fourier_k3": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                             "--cycle-len", "daily", "--cycle-harmonics", "3", "--phase-edges",
+                                             "--phase-harmonics", "2"],
+    "cross_par_l0_cycle_pedge8_fourier_k3": ["--architecture", "cross", *PATCH8, "--cross-parallel", "--edge-gates", "l0",
+                                             "--cycle-len", "daily", "--cycle-harmonics", "3", "--phase-edges",
+                                             "--phase-harmonics", "8"],
 }
-# Round 16: the learnable daily cycle normalized once, on ETTm1, ETTm2 and Weather at horizons 96 to 720 (run with
+# Round 17: phase-dependent edge weights and shared layers, on ETTm1, ETTm2 and Weather at horizons 96 to 720 (run with
 # --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720). Frequency tokens stay available (--freq-tokens, the freq* variants) but are left out of the default sweep:
 # they only helped at input 336 on two datasets, within noise.
-DEFAULT_VARIANTS = ["patch8_cycle_once", "cross_par_l0_cycle_once"]
+ROUND21 = ("hmae", "ptrain", "precipe", "precipe_lr0.001", "precipe_lr0.002")
+ROUND23_BASES = {"cross_par_l0_cycle_pedge_fourier_k3_precipe": "ETTm1", "patch8_cycle_once_fourier_full_precipe_lr0.002": "ETTm2",
+                 "patch8_cycle_once_fourier_k3": "Weather"}
+# Round 23: the rotating tokenizer kernel and PAMNet's carriers
+DEFAULT_VARIANTS = [f"{name}_{x}" for name in ROUND23_BASES for x in ROUND23] + ["patch8_cycle_once_fourier_k3_d64"]
 DEFAULT_SEEDS = [2021, 2022, 2023]
 # Variants that only run on some datasets (others show "–" in the summary)
 VARIANT_DATASETS = {
+    **{name: ("TWStock",) for name in FMT_RUN1},
+    **{f"{name}_noenc": ("TWStock",) for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    **{f"{name}_d4": ("TWStock",) for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    **{f"{name}_d16": ("TWStock",) for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    **{f"{name}_noenc_d16": ("TWStock",) for name in ("fmt_ettm1_best", "fmt_ettm2_best", "fmt_fi2010_best")},
+    **{f"{name}_rank{rank}": ("TWStock",) for name, ranks in (("fmt_ettm1_best", (4, 2)), ("fmt_ettm2_best", (4, 2)),
+                                                               ("fmt_fi2010_best", (8, 4))) for rank in ranks},
+    **{f"{name}_noenc_d16_rank{rank}": ("TWStock",)
+       for name, ranks in (("fmt_ettm1_best", (4, 2)), ("fmt_ettm2_best", (4, 2)), ("fmt_fi2010_best", (8, 4)))
+       for rank in ranks},
+    **{f"{name}_cut{i}{e}": ("TWStock",) for name in ("fmt_ettm2_best", "fmt_fi2010_best") for i in range(1, 6)
+       for e in ("", "_e40", "_e40_res")},
+    **{f"{name}_res": ("TWStock",) for name in FMT_RUN1},
+    **{name: ("TWStock",) for name in FMT_RUN8},
+    **{name: ("TWStock",) for name in FMT_RUN9},
+    **{name: ("TWStock",) for name in FMT_RUN10},
+    **{name: ("TWStock",) for name in FMT_RUN11},
+    # Round 23
+    **{f"{name}_{x}": (ds,) for name, ds in ROUND23_BASES.items() for x in ROUND23},
+    "patch8_cycle_once_fourier_k3_d64": ("Weather",),
+    # Rounds 21 and 22: each dataset's best model
+    **{f"cross_par_l0_cycle_pedge_fourier_k3_{x}": ("ETTm1",) for x in ROUND21},
+    **{f"patch8_cycle_once_fourier_full_{x}": ("ETTm2",) for x in ROUND21},
+    **{f"patch8_cycle_once_fourier_k3_{x}": ("Weather",) for x in ROUND21},
+    # PAMNet: the lr / alpha chosen on validation (horizon 96, seed 2021) for each dataset
+    "pamnet_d32_a0.05": ("ETTm1",),
+    "pamnet_d32_a0.35": ("ETTm2",),
+    "pamnet_d32_a0.2": ("Weather",),
+    "pamnet_lr0.005_a0.05": ("ETTm1",),
+    "pamnet_lr0.005_a0.35": ("ETTm2",),
+    "pamnet_lr0.005_a0.2": ("Weather",),
     # Learnable pairings are validated on the smaller datasets first
     "tree_soft": ("ETTm1", "ETTm2", "Weather"),
     "tree_sampled": ("ETTm1", "ETTm2", "Weather"),
@@ -210,6 +467,22 @@ VARIANT_DATASETS = {
     "cross_par_l0_drop": ("ETTm1", "ETTm2", "Weather"),
     "patch8_cycle_once": ("ETTm1", "ETTm2", "Weather"),
     "cross_par_l0_cycle_once": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_pedge": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_e2d2": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_e2d2_shared": ("ETTm1", "ETTm2", "Weather"),
+    "patch8_cycle_once_fourier_full": ("ETTm1", "ETTm2", "Weather"),
+    "patch8_cycle_once_fourier_k8": ("ETTm1", "ETTm2", "Weather"),
+    "patch8_cycle_once_fourier_k3": ("ETTm1", "ETTm2", "Weather"),
+    "patch8_cycle_once_fourier_k8_weekly": ("ETTm1", "ETTm2"),
+    "cross_par_l0_cycle_pedge_fourier": ("ETTm1", "ETTm2", "Weather"),
+    "cross_fused_cycle": ("ETTm1", "ETTm2", "Weather"),
+    "cross_fused_mlp_cycle": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_fourier_full": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_fourier_k3": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_pedge_fourier_k3": ("ETTm1", "ETTm2", "Weather"),
+    "cross_par_l0_cycle_pedge2_fourier_k3": ("ETTm1",),
+    "cross_par_l0_cycle_pedge8_fourier_k3": ("ETTm1",),
+    "cross_fused_own_mlp_cycle": ("ETTm1", "ETTm2", "Weather"),
     # Width and depth on the small presets; Traffic already uses d_model 64 and two encoder layers
     "patch8_d64": ("ETTm1", "ETTm2", "Weather"),
     "patch8_e2d2": ("ETTm1", "ETTm2", "Weather"),
@@ -330,6 +603,50 @@ def naive_baseline(dataset: str, seq_len: int, pred_len: int) -> tuple[float, fl
     return err.pow(2).mean().item(), err.abs().mean().item()
 
 
+def stock_baselines(seq_len: int, pred_len: int) -> list[tuple[str, list[tuple[float, float]]]]:
+    """Score in % / macro F1 on the TWStock test windows of always predicting down, always up, the direction of the
+    last input day (feature 0 of every stock is its scaled return), and the window-average trend of FI-2010: up when
+    the mean of the last b closes is above the close b days before them, b chosen on the validation score.
+    Feature 1 of every stock is its z-scored log close, which has the sign of every price difference."""
+    splits = build_stock_splits(seq_len, pred_len)
+    test = splits["test"]
+    f = test.num_features
+
+    def trend(windows, b: int) -> torch.Tensor:  # (S, W) mean of the last b closes minus the close before them
+        days = windows.starts + seq_len
+        close = windows.values[1::f]  # (S, T)
+        recent = torch.stack([close[:, days - 1 - j] for j in range(b)]).mean(dim=0)
+        return recent - close[:, days - 1 - b]
+
+    def split_score(windows, up: torch.Tensor) -> float:
+        r = windows.targets[:, windows.starts + seq_len]
+        valid = r.isfinite()
+        return torch.where(up[valid], r[valid], -r[valid]).mean().item()
+
+    lengths = [b for b in (1, 2, 3, 5, 10, 20, 40) if b < seq_len] + [seq_len - 1]
+    best_b = max(lengths, key=lambda b: split_score(splits["val"], trend(splits["val"], b) > 0))
+    days = test.starts + seq_len
+    r = test.targets[:, days]  # (S, W), the forecast day's returns
+    last = test.values[::f, days - 1]  # (S, W), the last input day's return
+    window_trend = trend(test, best_b)
+    valid = r.isfinite()
+    r, last, window_trend = r[valid], last[valid], window_trend[valid]
+
+    def scores(up: torch.Tensor) -> list[tuple[float, float]]:
+        score = 100 * torch.where(up, r, -r).mean().item() * test.return_scale
+        true = r > 0
+        f1 = []
+        for c in (False, True):
+            tp = ((up == c) & (true == c)).sum().item()
+            precision, recall = tp / max(1, int((up == c).sum())), tp / max(1, int((true == c).sum()))
+            f1.append(2 * precision * recall / max(1e-12, precision + recall))
+        return [(score, sum(f1) / 2)]
+
+    return [("always_down", scores(torch.zeros_like(r, dtype=torch.bool))),
+            ("always_up", scores(torch.ones_like(r, dtype=torch.bool))), ("previous_day", scores(last > 0)),
+            (f"window_trend_b{best_b}", scores(window_trend > 0))]
+
+
 def majority_baseline(dataset: str, seq_len: int, horizon: int) -> tuple[float, float]:
     """Macro F1 / accuracy of always predicting the most frequent training class, on the test windows."""
     splits = build_lob_splits(seq_len, horizon)
@@ -363,7 +680,7 @@ def write_summary(args: argparse.Namespace, failures: list[str]) -> str:
         "",
     ]
     columns = ["naive", *args.variants]
-    forecasting = [d for d in args.datasets if d not in LOB_DATASETS]
+    forecasting = [d for d in args.datasets if d not in LOB_DATASETS and d not in STOCK_DATASETS]
     for pred_len in args.pred_lens if forecasting else []:
         lines += [f"## Horizon {pred_len}", "", "| Dataset | " + " | ".join(columns) + " |",
                   "|---|" + "---|" * len(columns)]
@@ -420,6 +737,37 @@ def write_summary(args: argparse.Namespace, failures: list[str]) -> str:
                 for c in lob_columns
             ]
             lines.append(f"| {horizon} | " + " | ".join(cells) + " |")
+        lines.append("")
+    for dataset in [d for d in args.datasets if d in STOCK_DATASETS]:
+        baselines = {pred_len: stock_baselines(args.seq_len, pred_len) for pred_len in args.pred_lens}
+        naive = list(dict.fromkeys(name for rows in baselines.values() for name, _ in rows))
+        stock_columns = [*naive, *args.variants]
+        lines += [f"## {dataset} (next-day direction)", "",
+                  "Test score in % (mean of (2 y_hat - 1) r, mean ± std over seeds) / macro F1 (mean); bold marks the "
+                  "highest mean score in each row. 'previous_day' predicts the direction of the last input day; "
+                  "'window_trend_b<b>' predicts up when the mean of the last b closes is above the close before them "
+                  "(b chosen on the validation score).", "",
+                  "| Horizon | " + " | ".join(stock_columns) + " |", "|---|" + "---|" * len(stock_columns)]
+        for pred_len in args.pred_lens:
+            scores = dict(baselines[pred_len])
+            for variant in args.variants:
+                runs = []
+                for seed in args.seeds:
+                    path = result_path(dataset, pred_len, variant, seed)
+                    if path.exists():
+                        r = json.loads(path.read_text())
+                        runs.append((100 * r["test_score"], r["test_f1"]))
+                if runs:
+                    scores[variant] = runs
+            means = {c: sum(r[0] for r in runs) / len(runs) for c, runs in scores.items()}
+            best = max(means.values(), default=None)
+            cells = [
+                format_cell(scores[c], 1 if c in naive else len(args.seeds),
+                            means[c] == best)
+                if c in scores else "–"
+                for c in stock_columns
+            ]
+            lines.append(f"| {pred_len} | " + " | ".join(cells) + " |")
         lines.append("")
     lines += ["## Variants", ""]
     duplicates = []

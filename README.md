@@ -109,6 +109,44 @@ optimizer.step()
 - **Raise `n_rank` with long patches.** With `conv_stride > 1`, each channel's patch is compressed to `n_rank` numbers before channels are mixed. `n_rank = 1` with `kernel_size = 16` keeps only one weighted average per patch; `n_rank >= kernel_size` loses nothing.
 - **Check gate stability.** Correlated bands may be selected arbitrarily. Trust a selection only if it is stable across seeds and validation folds.
 
+## Stock return models (`stock_model.py`)
+
+`stock_model.py` holds a second model family: forecasts of every stock's open-to-close return on a trading day, from the prices up to the previous close and the news published before the open. It needs only NumPy and PyTorch and reads no data.
+
+- **Stage 1, walk-forward ridge** (`walk_forward`, `Ridge`): every year Y is forecast by a ridge fitted on all years before Y, with its penalty chosen on Y − 1 from the fit on the years before Y − 1, so no forecast or choice uses later data. `gap_block` adds a forecast of the opening gap log(open / previous close).
+- **Stage 2, residual network**: forecasts the ridge residual. Its output head starts at zero, so the untrained network is the ridge. `StockTokenEncoder` makes one token per stock from its whole input window (iTransformer style) and mixes the stocks by self-attention.
+  - `StockNewsAttention` adds a cross attention between the stock tokens and the day's news items, in four arrangements of query, key and value (`mode`).
+  - `StockIdentityAttention`: every news item queries the stocks by their identity (a fixed company embedding such as `comovement_embedding`, plus a learned one), reads their price states, and is pooled back onto the stocks it attended to.
+- **`TypedForm`**: a logits processor that makes a local language model fill a fixed form about a news text. The form tokens are forced, and each field is restricted to its choice letters, whose probabilities become the features.
+
+```python
+import torch
+from stock_model import StockIdentityAttention, comovement_embedding
+
+identity = torch.tensor(comovement_embedding(train_returns, dim=16))   # (S, 16) from a (T, S) training period
+net = StockIdentityAttention(n_stocks=100, window_dim=60 * 4, n_features=56, identity=identity, news_dim=20)
+e_hat = net(win, cur, news, tags)   # win (B, 100, 240), cur (B, 100, 56), news (B, N, 20), tags (B, N) -> (B, 100)
+```
+
+The data pipeline, the experiments and their results are in `demo/` (`demo/README.md`, `demo/EXPERIMENTS.md`, sections from "Walk-forward ridge without a fixed α" on). The market data, the news texts and the scores derived from them are not part of this repository. Walk-forward results, pooled over 2022–2026 for 100 stocks; score = mean of sign(forecast) × return, with standard errors clustered by day:
+
+| Model | Features | R² | Score |
+|---|---|---|---|
+| always down (trivial baseline) | — | — | +7.8e-4 ± 2.4e-4 |
+| multi-window polynomial ridge, degrees ≤ 3 (`demo/stock_poly.py`) | 230 | +0.0040 | +10.5e-4 ± 2.0e-4 |
+| polynomial ridge, degree 0 + daily range | 47 | +0.0046 | +12.7e-4 ± 2.0e-4 |
+| difference equations fitted per window, orders 1–3 (`demo/stock_diffeq.py`) | 91 | −0.0002 | +8.3e-4 ± 2.2e-4 |
+| block difference equations, stride 1, order 10, + range (`demo/stock_diffeq_order.py`) | 42 | +0.0070 | +13.9e-4 |
+| ridge, 52 base features (degree 0, range, US session) | 52 | +0.0087 | +14.3e-4 ± 2.1e-4 |
+| ridge, + the gap block | 55 | +0.0095 | +14.5e-4 ± 2.0e-4 |
+| + stock tokens, no news | 55 | +0.0092 | +14.3e-4 ± 2.1e-4 |
+| + `StockNewsAttention`, `stockq` | 55 | +0.0090 | +14.3e-4 ± 2.1e-4 |
+| + `StockNewsAttention`, `sigval` | 55 | +0.0093 | +14.4e-4 ± 2.0e-4 |
+
+The bilinear model (`demo/stock_bilinear.py`: r̂ = b₀ + Σₖ uₖᵀ Z vₖ over the last L days Z of 6 daily signals, with polynomial lag filters) was evaluated on one fixed split (train 2020–2023, validation 2024, test 2025–2026-08) rather than walk-forward. There, its cubic rank-2 version on 20 lags has 20 parameters and a test score of +16.9e-4, against +16.3e-4 for the 230-feature polynomial ridge and +11.0e-4 for always down.
+
+The rows of the main table differ slightly in their sample (the feature sets start on different days), so compare scores across rows only as rough levels; the sections of `demo/EXPERIMENTS.md` give paired differences on common samples. The networks do not beat the ridge yet. `StockIdentityAttention` has not been evaluated.
+
 ## Documentation
 
 - [`docs/architecture.html`](docs/architecture.html): detailed design reference for every module

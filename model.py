@@ -102,6 +102,37 @@ class Signalformer(nn.Module):
     and an FFN maps them to num_classes logits. forward then returns (N, num_classes); the forecast head, RevIN
     denormalization and output projection are skipped. output_length sets the number of decoder steps.
 
+    phase_edges=True (needs cycle_len, cross_parallel and edge_gates) makes the cross-signal edge weights depend on
+    the phase of each forecast step, a learnable W x C x C offset per decoder layer (see SignalParallelCrossBlock).
+    cross_fused="ffn" (or True; with cross_decoder) replaces the complete graph of cross-attentions by one fused
+    memory: at every encoder position the encoded tokens of all C signals are concatenated (C * d_model) and an FFN
+    (C * d_model -> 4 d_model -> d_model) projects them to d_model; cross_fused="mlp" uses one layer instead
+    (C * d_model -> d_model, then GELU); every signal's decoder then cross-attends to that one memory with an ordinary decoder block
+    (a learnable signal embedding on the decoder queries tells the decoders apart). No edge gates.
+    fused_own=True (with cross_fused) adds each signal's own encoded tokens to the fused memory, so every decoder
+    reads its own past directly, as with channel independence, plus the fused summary of all signals.
+    cycle_harmonics = K > 0 describes the cycle in the frequency domain instead of as a table of W values: a constant
+    plus K harmonics of the period W per signal, c(t) = a0 + sum_k a_k cos(2 pi k t / W) + b_k sin(2 pi k t / W),
+    evaluated at the steps it is needed (see FourierCycle). Every window then updates every coefficient, while each
+    value of the table only learns from the windows at its phase. K = W // 2 spans the same cycles as the table;
+    smaller K keeps only the smooth part. cycle_weekly = K_w > 0 adds K_w harmonics of the period 7 W.
+    phase_harmonics = K > 0 describes the phase offsets of phase_edges the same way, K harmonics per edge.
+    rot_conv = P > 0 (needs cycle_len) rotates the tokenizer kernel with the phase of each token: the n_rank time
+    filters of every input channel are taken in pairs, and the outputs of pair j = 1..P are rotated by the angle
+    2 pi j t / W, t the phase of the token's last input step (as RoPE, but by the time of day instead of the
+    position). The channel mixing after it is linear, so this is a kernel that turns with the time of day, without
+    extra parameters (see LowRankCausalConv1d). rot_offsets=True adds a learnable angle per signal and pair, so
+    the signals can be shifted in phase against each other.
+    signal_features = F > 1 (needs channel_independent without ci_latents) gives every signal F features: the input is
+    (N, C * F, L), feature-major within each signal (channel c * F + f), the tokenizer of each signal reads its F
+    features together, and the forecast (N, C, H) is of feature 0 of every signal (RevIN and the cycle are per
+    feature; the forecast is denormalized with feature 0's statistics). Used by TWStock: one signal per stock.
+    carrier = "table" or "fourier" (needs cycle_len and channel_independent without ci_latents) modulates the encoder
+    memory with PAMNet's phase and amplitude carriers, indexed by the phase of the last input step (see
+    PhaseCarrier): a table of W carriers, or carrier_harmonics harmonics of the period W.
+    share_layers=True makes adjacent pairs of encoder blocks and of decoder blocks one module (blocks 2k and
+    2k + 1 share all weights), so a stack of 2 layers has the parameters of 1.
+
     Training: add the gate penalty to the loss, e.g. loss = task_loss + lam * model.penalty().
     """
 
@@ -135,11 +166,23 @@ class Signalformer(nn.Module):
         raw_tokens: bool = False,
         cross_decoder: bool = False,
         cross_parallel: bool = False,
+        cross_fused: bool | str = False,
+        fused_own: bool = False,
         edge_gates: bool | str = False,
         output_signals: int = 0,
         num_classes: int = 0,
         cycle_len: int = 0,
         cycle_renorm: bool = True,
+        phase_edges: bool = False,
+        share_layers: bool = False,
+        cycle_harmonics: int = 0,
+        cycle_weekly: int = 0,
+        phase_harmonics: int = 0,
+        rot_conv: int = 0,
+        rot_offsets: bool = False,
+        carrier: str = "",
+        carrier_harmonics: int = 0,
+        signal_features: int = 1,
     ):
         super().__init__()
         if revin:
@@ -153,13 +196,51 @@ class Signalformer(nn.Module):
         assert edge_gates in ("", "l1", "l0"), "edge_gates must be False, True, 'l1' or 'l0'"
         assert not edge_gates or cross_decoder, "edge_gates requires cross_decoder=True"
         assert not cross_parallel or cross_decoder, "cross_parallel requires cross_decoder=True"
+        cross_fused = "ffn" if cross_fused is True else (cross_fused or "")
+        assert cross_fused in ("", "ffn", "mlp"), "cross_fused must be False, True, 'ffn' or 'mlp'"
+        assert not cross_fused or (cross_decoder and not cross_parallel and not edge_gates and not raw_tokens), (
+            "cross_fused requires cross_decoder=True, without cross_parallel, edge_gates or raw_tokens"
+        )
+        assert not fused_own or cross_fused, "fused_own requires cross_fused"
         assert output_signals in (0, in_channels) or channel_independent, "output_signals requires channel_independent"
         assert num_classes == 0 or output_signals in (0, in_channels), "num_classes replaces the output projection"
         assert cycle_len == 0 or (num_classes == 0 and out_channels == in_channels and output_signals in (0, in_channels)), (
             "cycle_len requires a forecast of the input signals"
         )
-        self.cycle = nn.Parameter(torch.zeros(cycle_len, in_channels)) if cycle_len > 0 else None
+        assert cycle_len > 0 or not (cycle_harmonics or cycle_weekly), "cycle_harmonics requires cycle_len > 0"
+        assert not cycle_weekly or cycle_harmonics, "cycle_weekly requires cycle_harmonics (the frequency-domain cycle)"
+        assert cycle_harmonics <= cycle_len // 2 and cycle_weekly <= 7 * cycle_len // 2, "more harmonics than the period has"
+        assert signal_features == 1 or (channel_independent and ci_latents == 0 and not freq_tokens and not raw_tokens), (
+            "signal_features > 1 requires channel_independent without ci_latents, freq_tokens or raw_tokens"
+        )
+        self.signal_features = signal_features
+        channels = in_channels * signal_features  # input channels: every feature of every signal
+        self.cycle_len = cycle_len
+        self.cycle: nn.Parameter | FourierCycle | None
+        if cycle_len > 0 and cycle_harmonics > 0:
+            periods = [(cycle_len, cycle_harmonics)] + ([(7 * cycle_len, cycle_weekly)] if cycle_weekly else [])
+            self.cycle = FourierCycle(channels, periods)
+        else:
+            self.cycle = nn.Parameter(torch.zeros(cycle_len, channels)) if cycle_len > 0 else None
         self.cycle_renorm = cycle_renorm
+        assert not rot_conv or cycle_len > 0, "rot_conv requires cycle_len > 0 (for the phase)"
+        assert 2 * rot_conv <= n_rank and rot_conv <= cycle_len // 2, "rot_conv rotates at most n_rank / 2 filter pairs"
+        assert not rot_offsets or rot_conv, "rot_offsets requires rot_conv"
+        assert carrier in ("", "table", "fourier"), "carrier must be '', 'table' or 'fourier'"
+        assert not carrier or (cycle_len > 0 and channel_independent and ci_latents == 0), (
+            "carrier requires cycle_len > 0 and channel_independent without ci_latents"
+        )
+        assert (carrier == "fourier") == (carrier_harmonics > 0), "carrier='fourier' needs carrier_harmonics > 0"
+        assert carrier_harmonics <= cycle_len // 2, "more harmonics than the period has"
+        self.rot_conv = rot_conv
+        # rot_offset[c, j]: learnable angle added to pair j of signal c, zero at the start
+        self.rot_offset = nn.Parameter(torch.zeros(in_channels, rot_conv)) if rot_offsets else None
+        self.carrier = (
+            PhaseCarrier(d_model, in_channels, cycle_len, carrier_harmonics, dropout) if carrier else None
+        )
+        assert not phase_edges or (cycle_len > 0 and cross_parallel and edge_gates), (
+            "phase_edges requires cycle_len > 0 (for the phase), cross_parallel and edge_gates"
+        )
         self.output_length = output_length
         if num_classes > 0:
             if channel_independent:
@@ -182,13 +263,13 @@ class Signalformer(nn.Module):
         self.channel_independent = channel_independent
         # Latent projection (C -> K signals per time step); RevIN then normalizes the C original signals
         self.latent_proj = nn.Linear(in_channels, ci_latents, bias=False) if ci_latents > 0 else None
-        revin_channels = 1 if channel_independent and ci_latents == 0 else in_channels
+        revin_channels = signal_features if channel_independent and ci_latents == 0 else in_channels
         self.revin = RevIN(revin_channels) if revin else None
         num_signals = in_channels
         if channel_independent:
             assert out_channels == in_channels, "channel_independent requires out_channels == in_channels"
             # every submodule sees one signal at a time; with latents the output head maps K latents back to C
-            in_channels = 1
+            in_channels = signal_features
             out_channels = out_channels if ci_latents > 0 else 1
         self.tokenizer = SignalTokenizer(
             in_channels,
@@ -218,11 +299,20 @@ class Signalformer(nn.Module):
             raw_tokens=raw_tokens,
             cross_signals=num_signals if cross_decoder else 0,
             cross_parallel=cross_parallel,
+            cross_fused=cross_fused,
+            fused_own=fused_own,
             edge_gates=edge_gates,
+            phase_edges=cycle_len if phase_edges else 0,
+            phase_harmonics=phase_harmonics,
         )
         # The frequency and raw tokens describe the signals the tokenizer sees (one signal with channel independence)
         self.freq_embed = FrequencyEmbedding(in_channels, in_len, d_model) if freq_tokens else None
         self.raw_embed = nn.Linear(in_channels, d_model) if raw_tokens else None
+        if share_layers:
+            # adjacent pairs of encoder and of decoder blocks are one module: blocks 2k and 2k + 1 share every weight
+            for blocks in (self.encoder.blocks, self.decoder.blocks):
+                for i in range(1, len(blocks), 2):
+                    blocks[i] = blocks[i - 1]
 
     def forward(
         self,
@@ -239,14 +329,31 @@ class Signalformer(nn.Module):
         assert phase is not None, "phase is required with cycle_len > 0"
         input_len, output_len = input.size(-1), self.output_length
         steps = torch.arange(input_len + output_len, device=input.device)
-        cycle = self.cycle[(phase[:, None] + steps) % self.cycle.size(0)].transpose(1, 2)  # (N, C, L + H)
+        positions = phase[:, None] + steps  # (N, L + H) absolute time steps
+        if isinstance(self.cycle, FourierCycle):
+            cycle = self.cycle(positions).transpose(1, 2)  # (N, C, L + H)
+        else:
+            cycle = self.cycle[positions % self.cycle_len].transpose(1, 2)  # (N, C, L + H)
         mean = input.mean(dim=-1, keepdim=True)
         std = (input.var(dim=-1, keepdim=True, unbiased=False) + 1e-5).sqrt()
         residual = (input - mean) / std - cycle[..., :input_len]
+        # phase of every decoder step (the forecast steps), for the phase-dependent edge weights
+        step_phase = (phase[:, None] + input_len + torch.arange(output_len * self.decoder.samples_per_output,
+                      device=input.device) // self.decoder.samples_per_output) % self.cycle_len
+        # phase of each token's last input step (rotating kernel) and of the last input step (carriers)
+        token_phase = end_phase = None
+        if self.rot_conv:
+            offset, stride = self.tokenizer.token_positions(input_len)
+            num_tokens = (input_len - 1 - offset) // stride + 1
+            token_phase = (phase[:, None] + offset + stride * torch.arange(num_tokens, device=input.device)) % self.cycle_len
+        if self.carrier is not None:
+            end_phase = (phase + input_len - 1) % self.cycle_len
         output = self.forward_residual(
-            residual, time_features, future_time_features, text_memory, text_padding_mask, normalize=self.cycle_renorm
+            residual, time_features, future_time_features, text_memory, text_padding_mask, normalize=self.cycle_renorm,
+            step_phase=step_phase, token_phase=token_phase, end_phase=end_phase,
         )
-        return (output + cycle[..., input_len:]) * std + mean
+        target = torch.arange(0, input.size(1), self.signal_features, device=input.device)  # feature 0 of every signal
+        return (output + cycle[:, target, input_len:]) * std[:, target] + mean[:, target]
 
     def forward_residual(
         self,
@@ -256,7 +363,13 @@ class Signalformer(nn.Module):
         text_memory: torch.Tensor | None = None,
         text_padding_mask: torch.Tensor | None = None,
         normalize: bool = True,
+        step_phase: torch.Tensor | None = None,
+        token_phase: torch.Tensor | None = None,
+        end_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # step_phase: (N, L_dec) phase (step modulo cycle_len) of every decoder step, used by phase_edges
+        # token_phase: (N, T) phase of each token's last input step (rot_conv); end_phase: (N,) phase of the last
+        # input step (carrier)
         # normalize=False skips RevIN (the cycle path has normalized the window already)
         # input: (N, C, L), time_features: (N, L, time_dim)
         # future_time_features: (N, output_length * samples_per_output, time_dim)
@@ -274,19 +387,33 @@ class Signalformer(nn.Module):
             input = self.latent_proj(input.transpose(1, 2)).transpose(1, 2)  # (N, C, L) -> (N, K, L)
             if self.latent_norm is not None:
                 input, _ = self.latent_norm.normalize(input)  # input side only; outputs are C signals, not latents
-        num_signals = input.size(1)
+        num_signals = input.size(1) // self.signal_features
         if self.channel_independent:
             # (N, C, L) -> (N * C, 1, L); per-sample inputs are repeated for each of its signals
-            input = input.reshape(batch * num_signals, 1, -1)
+            input = input.reshape(batch * num_signals, self.signal_features, -1)
             repeat = lambda t: None if t is None else t.repeat_interleave(num_signals, dim=0)  # noqa: E731
             time_features, future_time_features = repeat(time_features), repeat(future_time_features)
             text_memory, text_padding_mask = repeat(text_memory), repeat(text_padding_mask)
+            token_phase, end_phase = repeat(token_phase), repeat(end_phase)
         if self.revin is not None and self.latent_proj is None and normalize:
             input, stats = self.revin.normalize(input)
         freq_memory = self.freq_embed(input) if self.freq_embed is not None else None  # (N, L // 2 + 1, d_model)
         raw_memory = self.raw_embed(input.transpose(1, 2)) if self.raw_embed is not None else None  # (N, L, d_model)
-        tokens = self.tokenizer(input, time_features)  # (N, T, d_model)
+        # signal of every row: rows are (sample, signal) with channel independence, else one row per sample
+        signal = torch.arange(input.size(0), device=input.device) % num_signals if self.channel_independent else None
+        rot_angle = None
+        if self.rot_conv:
+            assert token_phase is not None, "rot_conv requires the phase (cycle_len > 0)"
+            j = torch.arange(1, self.rot_conv + 1, device=input.device, dtype=torch.float32)
+            rot_angle = token_phase.float().unsqueeze(1) * j[:, None] * (2 * math.pi / self.cycle_len)  # (N, P, T)
+            if self.rot_offset is not None:
+                assert signal is not None, "rot_offsets requires channel_independent"
+                rot_angle = rot_angle + self.rot_offset.float()[signal].unsqueeze(-1)
+        tokens = self.tokenizer(input, time_features, rot_angle)  # (N, T, d_model)
         memory = self.encoder(tokens)  # (N, T, d_model)
+        if self.carrier is not None:
+            assert end_phase is not None and signal is not None
+            memory = self.carrier(memory, end_phase, signal)
         future_time = self.tokenizer.embed_time(future_time_features) if future_time_features is not None else None
         # Positions in input-time units: token j ends at input step memory_offset + j * memory_stride, and the
         # first forecast step is input step L.
@@ -302,6 +429,7 @@ class Signalformer(nn.Module):
             memory_stride=memory_stride,
             freq_memory=freq_memory,
             raw_memory=raw_memory,
+            step_phase=step_phase,
         )  # (N, output_length * samples_per_output, d_model)
         if self.latent_proj is not None:
             # (N * K, L_dec, d) -> (N, L_dec, K * d): the K latents' outputs of each step side by side
@@ -312,7 +440,9 @@ class Signalformer(nn.Module):
             return self.class_head(features.mean(dim=1).reshape(batch, -1))
         output = self.decoder.head(features)  # (N, out_channels, output_length)
         if self.revin is not None and stats is not None:
-            output = self.revin.denormalize(output, stats)
+            if self.signal_features > 1:  # the forecast is of feature 0
+                stats = (stats[0][:, :1], stats[1][:, :1])
+            output = self.revin.denormalize(output, stats, channels=output.size(1))
         if self.channel_independent and self.latent_proj is None:
             output = output.reshape(batch, num_signals, -1)
         # (N, C, H) -> (N, output_signals, H), mixing the signals of each step
@@ -323,14 +453,97 @@ class Signalformer(nn.Module):
 
     def edge_penalty(self) -> torch.Tensor:
         """Mean over decoder layers of SignalCrossBlock.edge_penalty; zero without edge gates."""
-        blocks = [b for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None]
+        blocks = self.gated_blocks()
         if not blocks:
             return self.decoder.queries.new_zeros(())
         return torch.stack([b.edge_penalty() for b in blocks]).mean()
 
     def edge_weights(self) -> list[torch.Tensor]:
         """Effective C x C edge weights of every gated decoder layer (masks sampled in training mode)."""
-        return [b.edge_weights() for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None]
+        return [b.edge_weights() for b in self.gated_blocks()]
+
+    def gated_blocks(self) -> list[nn.Module]:
+        """Decoder blocks with edge gates, each once (share_layers makes adjacent blocks the same module)."""
+        return list({id(b): b for b in self.decoder.blocks if getattr(b, "edge_gate", None) is not None}.values())
+
+
+def harmonic_basis(positions: torch.Tensor, period: int, harmonics: int) -> torch.Tensor:
+    """(..., 2K) values [cos(2 pi k t / P) for k = 1..K, sin(2 pi k t / P) for k = 1..K] at integer steps t.
+
+    The steps are reduced modulo the period first and the angles computed in fp32 (also under autocast), so
+    large absolute steps lose no precision.
+    """
+    k = torch.arange(1, harmonics + 1, device=positions.device, dtype=torch.float32)
+    angle = (positions % period).float().unsqueeze(-1) * k * (2 * math.pi / period)  # (..., K)
+    return torch.cat([angle.cos(), angle.sin()], dim=-1)
+
+
+class FourierCycle(nn.Module):
+    """A learnable cycle per signal described by its Fourier coefficients, evaluated at any time step.
+
+    c(t) = a0 + sum over periods P and k = 1..K_P of a_{P,k} cos(2 pi k t / P) + b_{P,k} sin(2 pi k t / P), per signal.
+    - The values are computed directly at the steps that are needed (the inverse transform restricted to them), so
+      no table of P values is built and several periods (a day and a week) can be added at little cost.
+    - With one period P and K = P // 2 it spans exactly the cycles of a table of P values (for even P the sine of
+      the last harmonic is zero at every step and stays unused); smaller K keeps only the smooth part.
+    - All coefficients start at zero, like the table of the time-domain cycle.
+    """
+
+    def __init__(self, num_signals: int, periods: list[tuple[int, int]]) -> None:
+        super().__init__()
+        self.periods = [(int(p), int(k)) for p, k in periods]
+        self.bias = nn.Parameter(torch.zeros(num_signals))
+        # coef[i]: (2 K_i, C), the cosine then the sine coefficients of period i
+        self.coef = nn.ParameterList(nn.Parameter(torch.zeros(2 * k, num_signals)) for _, k in self.periods)
+
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:  # (N, S) absolute steps -> (N, S, C)
+        with torch.autocast(positions.device.type, enabled=False):
+            out = self.bias
+            for (period, harmonics), coef in zip(self.periods, self.coef):
+                out = out + harmonic_basis(positions, period, harmonics) @ coef.float()
+        return out
+
+
+class PhaseCarrier(nn.Module):
+    """PAMNet's phase and amplitude carriers (arXiv 2605.02938), applied to the encoder memory as a residual.
+
+    m' = m + M_P(m, e_p[t]) + M_A(m, e_a[t, c]), M(x, s) = W3 Dropout(SiLU(W1 x) * W2 s), with t the phase of the
+    window's last input step and c the row's signal. e_p (shared by the signals) and e_a (one per signal) are
+    tables of W carriers of d_model values (harmonics = 0, as PAMNet, Xavier normal) or K harmonics of the period W
+    (harmonics = K). W3 starts at zero, so the model starts as the one without carriers.
+    """
+
+    def __init__(self, d_model: int, num_signals: int, period: int, harmonics: int, dropout: float) -> None:
+        super().__init__()
+        self.period, self.harmonics, self.d_model = period, harmonics, d_model
+        rows = 2 * harmonics if harmonics else period
+        self.phase_embed = nn.Parameter(torch.empty(rows, d_model))
+        self.amplitude_embed = nn.Parameter(torch.empty(rows, num_signals * d_model))
+        nn.init.xavier_normal_(self.phase_embed)
+        nn.init.xavier_normal_(self.amplitude_embed)
+        self.w1 = nn.ModuleList(nn.Linear(d_model, d_model) for _ in range(2))
+        self.w2 = nn.ModuleList(nn.Linear(d_model, d_model) for _ in range(2))
+        self.w3 = nn.ModuleList(nn.Linear(d_model, d_model) for _ in range(2))
+        for w in self.w3:
+            nn.init.zeros_(w.weight)
+            nn.init.zeros_(w.bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, memory: torch.Tensor, phase: torch.Tensor, signal: torch.Tensor) -> torch.Tensor:
+        # memory: (N, T, d), phase: (N,) phase of the last input step, signal: (N,) signal of each row
+        if self.harmonics:
+            basis = harmonic_basis(phase, self.period, self.harmonics)  # (N, 2K), fp32
+            e_p, e_a = basis @ self.phase_embed.float(), basis @ self.amplitude_embed.float()
+        else:
+            e_p, e_a = self.phase_embed[phase], self.amplitude_embed[phase]
+        e_a = e_a.view(-1, self.amplitude_embed.size(1) // self.d_model, self.d_model)[
+            torch.arange(signal.size(0), device=signal.device), signal
+        ]  # (N, d)
+        out = memory
+        for i, carrier in enumerate((e_p, e_a)):
+            mod = F.silu(self.w1[i](memory)) * self.w2[i](carrier.to(memory.dtype)).unsqueeze(1)
+            out = out + self.w3[i](self.dropout(mod))
+        return out
 
 
 class RevIN(nn.Module):
@@ -355,11 +568,13 @@ class RevIN(nn.Module):
             x = x * self.weight.view(1, -1, 1) + self.bias.view(1, -1, 1)
         return x, (mean, std)
 
-    def denormalize(self, output: torch.Tensor, stats: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-        # output: (N, C, H)
+    def denormalize(self, output: torch.Tensor, stats: tuple[torch.Tensor, torch.Tensor],
+                    channels: int | None = None) -> torch.Tensor:
+        # output: (N, C, H); channels = K uses the affine parameters of the first K channels only
         mean, std = stats
         if self.weight is not None and self.bias is not None:
-            output = (output - self.bias.view(1, -1, 1)) / (self.weight.view(1, -1, 1) + self.eps)
+            weight, bias = self.weight[:channels], self.bias[:channels]
+            output = (output - bias.view(1, -1, 1)) / (weight.view(1, -1, 1) + self.eps)
         return output * std + mean
 
 
@@ -448,8 +663,10 @@ class SignalTokenizer(nn.Module):
         assert self.time_proj is not None, "time features given but time_dim == 0"
         return self.time_proj(time_features)
 
-    def forward(self, input: torch.Tensor, time_features: torch.Tensor | None = None) -> torch.Tensor:
-        # input: (N, C, L), time_features: (N, L, time_dim)
+    def forward(
+        self, input: torch.Tensor, time_features: torch.Tensor | None = None, rot_angle: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # input: (N, C, L), time_features: (N, L, time_dim), rot_angle: (N, P, T) angles of the rotating kernel
         #
         # Time feature notes:
         # - Encode cyclical fields (day of week, month, day of year) with sin/cos pairs, not raw integers,
@@ -468,7 +685,7 @@ class SignalTokenizer(nn.Module):
             # Grouped channel conv needs each signal's bands to be contiguous: band-major -> signal-major
             n, _, length = x.shape
             x = x.view(n, -1, self.in_channels, length).transpose(1, 2).reshape(n, -1, length)
-        x = F.gelu(self.conv(x))  # (N, d_model, T)
+        x = F.gelu(self.conv(x, rot_angle))  # (N, d_model, T)
         x = x.transpose(1, 2)  # (N, T, d_model)
         if self.raw_proj is not None:
             # Left zero padding to a multiple of the stride aligns patches with the conv: token j covers the
@@ -529,6 +746,10 @@ class SignalDecoder(nn.Module):
         cross_signals: int = 0,
         cross_parallel: bool = False,
         edge_gates: str = "",
+        phase_edges: int = 0,
+        phase_harmonics: int = 0,
+        cross_fused: str = "",
+        fused_own: bool = False,
     ) -> None:
         super().__init__()
         # One learnable query per future step (non-autoregressive: all steps are predicted at once).
@@ -546,6 +767,8 @@ class SignalDecoder(nn.Module):
                 raw_tokens=raw_tokens,
                 edge_gate_signals=cross_signals if edge_gates else 0,
                 edge_l0=edge_gates == "l0",
+                phase_edges=phase_edges,
+                phase_harmonics=phase_harmonics,
             )
             if cross_signals > 0 and cross_parallel
             else SignalCrossBlock(
@@ -556,13 +779,34 @@ class SignalDecoder(nn.Module):
                 edge_gate_signals=cross_signals if edge_gates else 0,
                 edge_l0=edge_gates == "l0",
             )
-            if cross_signals > 0
+            if cross_signals > 0 and not cross_fused
             else CrossTransformerBlock(
                 d_model, num_heads, dropout, text_dim=text_dim, freq_tokens=freq_tokens, raw_tokens=raw_tokens
             )
             for _ in range(num_layers)
         )
         self.signal_embed = nn.Parameter(torch.randn(cross_signals, d_model) * 0.02) if cross_signals > 0 else None
+        # cross_fused: the C signals' encoded tokens at each position, concatenated, -> FFN ("ffn") or one layer
+        # ("mlp") -> one d_model memory
+        self.fuse = (
+            nn.Sequential(
+                nn.RMSNorm(cross_signals * d_model),
+                nn.Linear(cross_signals * d_model, 4 * d_model),
+                nn.GELU(),
+                nn.Linear(4 * d_model, d_model),
+                nn.Dropout(dropout),
+            )
+            if cross_fused == "ffn"
+            else nn.Sequential(
+                nn.RMSNorm(cross_signals * d_model),
+                nn.Linear(cross_signals * d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+            if cross_fused == "mlp"
+            else None
+        )
+        self.fused_own = fused_own  # add each signal's own tokens to the fused memory
         self.text_dim = text_dim  # width of external text embeddings; 0 disables text cross-attention
         self.norm = nn.RMSNorm(d_model)
         # Each output step aggregates samples_per_output decoder tokens (e.g. 7 for daily input -> weekly
@@ -605,6 +849,7 @@ class SignalDecoder(nn.Module):
         memory_stride: int = 1,
         freq_memory: torch.Tensor | None = None,
         raw_memory: torch.Tensor | None = None,
+        step_phase: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Normalized decoder outputs before the head: (N, output_length * samples_per_output, d_model)."""
         # memory: (N, T, d_model) from the encoder
@@ -634,7 +879,14 @@ class SignalDecoder(nn.Module):
             # rows of memory and y are (sample, signal) pairs in sample-major order: row r is signal r % C
             num_signals, (rows, length, d) = self.cross_signals, memory.shape
             y = y + self.signal_embed.repeat(rows // num_signals, 1).unsqueeze(1)
-            memory = memory.view(-1, num_signals, length, d) + self.signal_embed.view(1, num_signals, 1, d)
+            if self.fuse is not None:
+                # (N * C, T, D) -> (N, T, C * D) -> (N, T, D), the same fused memory for every signal of a sample;
+                # the concatenation order tells the signals apart, so the memory gets no signal embedding
+                fused = self.fuse(memory.view(-1, num_signals, length, d).transpose(1, 2).reshape(-1, length, num_signals * d))
+                fused = fused.repeat_interleave(num_signals, dim=0)  # (N * C, T, D)
+                memory = memory + fused if self.fused_own else fused
+            else:
+                memory = memory.view(-1, num_signals, length, d) + self.signal_embed.view(1, num_signals, 1, d)
         for block in self.blocks:
             y = block(
                 y,
@@ -646,6 +898,8 @@ class SignalDecoder(nn.Module):
                 text_padding_mask=text_padding_mask,
                 freq_memory=freq_memory,
                 raw_memory=raw_memory,
+                # only the phase-dependent edge weights use the phase of every step
+                **({"step_phase": step_phase} if getattr(block, "phase_period", 0) else {}),
             )
         return self.norm(y)
 
@@ -704,13 +958,29 @@ class LowRankCausalConv1d(nn.Module):
             in_channels * n_rank * len(kernel_sizes), out_channels, kernel_size=1, groups=channel_groups
         )
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:  # (N, C_in, L)
+    def forward(self, input: torch.Tensor, rot_angle: torch.Tensor | None = None) -> torch.Tensor:  # (N, C_in, L)
+        # rot_angle: (N, P, T) rotates the outputs of filter pairs (0, 1), ..., (2P - 2, 2P - 1) of every input
+        # channel by these angles at every output step: a kernel that turns with the phase of each step
         n, c = input.shape[:2]
         # (N, C_in * n_rank, T) per kernel size; outputs of the same input channel stay contiguous so channel
         # groups still see whole input channels: (N, C_in, K, n_rank, T) -> (N, C_in * K * n_rank, T)
         outs = [conv(input).view(n, c, 1, self.n_rank, -1) for conv in self.time_convs]
+        if rot_angle is not None:
+            outs = [self.rotate(out, rot_angle) for out in outs]
         x = torch.cat(outs, dim=2).flatten(1, 3)
         return self.channel_conv(x)  # (N, C_out, T)
+
+    @staticmethod
+    def rotate(out: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+        # out: (N, C_in, 1, n_rank, T), angle: (N, P, T); pair j is filters 2j and 2j + 1
+        n, c, _, rank, length = out.shape
+        pairs = angle.size(1)
+        z = out[:, :, :, : 2 * pairs].float().view(n, c, 1, pairs, 2, length)
+        cos, sin = angle.cos()[:, None, None], angle.sin()[:, None, None]  # (N, 1, 1, P, T)
+        first = z[..., 0, :] * cos - z[..., 1, :] * sin
+        second = z[..., 0, :] * sin + z[..., 1, :] * cos
+        rotated = torch.stack([first, second], dim=-2).view(n, c, 1, 2 * pairs, length).to(out.dtype)
+        return torch.cat([rotated, out[:, :, :, 2 * pairs :]], dim=3)
 
 
 class MultiScaleDecomp(nn.Module):
@@ -1165,13 +1435,17 @@ class SignalCrossBlock(nn.Module):
                 x = x + scale * self.dropout(update)
         return x + self.dropout(self.ffn(self.ffn_norm(x)))
 
-    def edge_weights(self) -> torch.Tensor:
-        """(C, C) weights of the updates, the gates times the off-diagonal masks (sampled in training mode)."""
+    def edge_weights(self, offset: torch.Tensor | None = None) -> torch.Tensor:
+        """(C, C) weights of the updates, the gates times the off-diagonal masks (sampled in training mode).
+
+        offset: (..., C, C) added to the gates before the masks (the phase offsets); the result is (..., C, C).
+        """
+        gates = self.edge_gate if offset is None else self.edge_gate + offset
         if self.edge_mask is None:
-            return self.edge_gate
+            return gates
         eye = torch.eye(self.edge_gate.size(0), dtype=torch.bool, device=self.edge_gate.device)
         mask = self.edge_mask.gate_values().view_as(self.edge_gate)
-        return self.edge_gate * torch.where(eye, torch.ones_like(mask), mask)
+        return gates * torch.where(eye, torch.ones_like(mask), mask)
 
     def edge_penalty(self) -> torch.Tensor:
         """L1: mean |gate| off the diagonal. L0: expected fraction of open off-diagonal edges."""
@@ -1195,6 +1469,14 @@ class SignalParallelCrossBlock(SignalCrossBlock):
     - Edge gates and L0 masks work as in SignalCrossBlock: g[i, j] scales the output of source j for receiver i
       before the concatenation. Without gates every source enters the projection unscaled.
     - The projection has C * D * D weights per block, so this suits tens of signals, not hundreds.
+    - phase_edges = W > 0 (needs edge gates) makes the edge weights depend on the phase of each decoder step, as
+      TQNet's periodic queries make its channel attention depend on the time of day: a learnable table of W x C x C
+      offsets, indexed by the step modulo W, is added to the gates before the L0 masks, so receiver i weighs
+      source j by (g[i, j] + p[t mod W, i, j]) * m[i, j]. The masks stay shared by all phases (an edge closed
+      by L0 is closed at every phase). The offsets start at zero, so the model starts as the plain gated block.
+    - phase_harmonics = K > 0 replaces the W x C x C table by K harmonics of the period W per edge,
+      p[t, i, j] = sum_k a_k[i, j] cos(2 pi k t / W) + b_k[i, j] sin(2 pi k t / W): 2 K x C x C parameters, a smooth
+      offset, and no constant term (the gates are the constant).
     """
 
     def __init__(
@@ -1206,9 +1488,27 @@ class SignalParallelCrossBlock(SignalCrossBlock):
         raw_tokens: bool = False,
         edge_gate_signals: int = 0,
         edge_l0: bool = False,
+        phase_edges: int = 0,
+        phase_harmonics: int = 0,
     ) -> None:
         super().__init__(d_model, num_heads, dropout, raw_tokens, edge_gate_signals, edge_l0)
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert not phase_edges or edge_gate_signals > 0, "phase_edges requires edge gates"
+        # phase_gate[t mod W, i, j]: offset of the weight of signal j's update to signal i at that phase
+        assert not phase_harmonics or phase_edges, "phase_harmonics requires phase_edges"
+        assert phase_harmonics <= phase_edges // 2, "more harmonics than the period has"
+        self.phase_period = phase_edges
+        self.phase_gate = (
+            nn.Parameter(torch.zeros(phase_edges, edge_gate_signals, edge_gate_signals))
+            if phase_edges and not phase_harmonics
+            else None
+        )
+        # phase_coef[k, 0 | 1, i, j]: cos and sin coefficients of harmonic k + 1 of the offset of edge (i, j)
+        self.phase_coef = (
+            nn.Parameter(torch.zeros(phase_harmonics, 2, edge_gate_signals, edge_gate_signals))
+            if phase_harmonics
+            else None
+        )
         del self.cross_attn  # replaced by the parallel projections below
         self.num_heads = num_heads
         self.num_signals = num_signals
@@ -1226,9 +1526,11 @@ class SignalParallelCrossBlock(SignalCrossBlock):
         memory_offset: int = 0,
         memory_stride: int = 1,
         raw_memory: torch.Tensor | None = None,
+        step_phase: torch.Tensor | None = None,
         **_: object,
     ) -> torch.Tensor:
         # input: (N * C, L, D), memory: (N, C, T, D), raw_memory: (N * C, L_in, D)
+        # step_phase: (N, L) phase of every decoder step, required with phase_edges
         x = input + self.dropout(self.self_attn(self.self_attn_norm(input), offset))
         if self.raw_attn is not None and raw_memory is not None:
             x = x + self.dropout(
@@ -1250,7 +1552,18 @@ class SignalParallelCrossBlock(SignalCrossBlock):
         )  # (N, C, C, H, L, D/H)
         if self.edge_gate is not None:
             assert self.edge_gate.size(0) == num_signals, "edge gates were built for a different number of signals"
-            y = y * self.edge_weights().view(1, num_signals, num_signals, 1, 1, 1)
+            if self.phase_gate is None and self.phase_coef is None:
+                y = y * self.edge_weights().view(1, num_signals, num_signals, 1, 1, 1)
+            else:
+                assert step_phase is not None and step_phase.shape == (n, l_q), "phase_edges requires step_phase"
+                if self.phase_gate is not None:
+                    offset = self.phase_gate[step_phase]  # (N, L, C_i, C_j)
+                else:
+                    basis = harmonic_basis(step_phase, self.phase_period, self.phase_coef.size(0))  # (N, L, 2K)
+                    coef = self.phase_coef.transpose(0, 1).reshape(-1, num_signals * num_signals)  # (2K, C * C)
+                    offset = (basis @ coef).view(n, l_q, num_signals, num_signals)
+                weights = self.edge_weights(offset)  # (N, L, C_i, C_j)
+                y = y * weights.permute(0, 2, 3, 1)[:, :, :, None, :, None]
         # (N, C_i, L, C_j, H, D/H) -> (N * C, L, C * D): source-major concatenation, heads inside each source
         y = y.permute(0, 1, 4, 2, 3, 5).reshape(n * num_signals, l_q, num_signals * d)
         x = x + self.dropout(self.out_proj(y))

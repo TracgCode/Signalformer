@@ -43,7 +43,7 @@ FI-2010 follows Setup 2 of the DeepLOB paper: the first 7 days train, the last 3
 - Do not edit `train.py` or `datasets.py` while a sweep runs: each run starts a new process that loads the current files.
 
 ```bash
-python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 16: cycle normalized once, 3 seeds
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720   # round 23: rotating tokenizer kernel and PAMNet's carriers, 3 seeds
 python demo/run_benchmarks.py --seeds 2021                     # a single seed
 python demo/run_benchmarks.py --pred-lens 96 192 336 720
 python demo/run_benchmarks.py --datasets ETTm1 Weather --variants ci_raw tree_corr
@@ -53,7 +53,65 @@ python demo/run_benchmarks.py -- --epochs 5                    # arguments after
 
 The `train.py` defaults are channel independence (every signal runs through the model separately with shared weights; Traffic uses batch size 4) with the raw-input skip: the `ci_raw` configuration. Earlier rounds used other defaults, so each variant spells out its mode and keeps its original meaning. `SHARED` below means `--shared --no-raw-skip`: all signals in one token sequence, as in the first rounds. Results and conclusions of every round are in [EXPERIMENTS.md](EXPERIMENTS.md).
 
-Round 16, the default sweep (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+Round 23, the default sweep (each dataset's best model and recipe at horizons 96, 192, 336 and 720): `<best>_rotconv`, `_rotconv_half` and `_rotconv_sig` turn the tokenizer kernel with the time of day (`--rot-conv`, `--rot-offsets`); `<best>_pamod` and `_pamod_table` add PAMNet's phase and amplitude carriers to the encoder memory (`--carrier`); `patch8_cycle_once_fourier_k3_d64` is the Weather capacity control. Round 22: `<best>_precipe_lr0.001` and `_precipe_lr0.002`. Round 21 (run with `--variants`):
+
+| Variant | Change |
+|---|---|
+| `<best>_hmae` | PAMNet's hybrid MAE loss in time and frequency, with PAMNet's alpha for the dataset (0.05 / 0.35 / 0.2) |
+| `<best>_ptrain` | PAMNet's schedule: Adam without weight decay, batch 256, up to 30 epochs with patience 5 on the full validation split, 'type3' decay, lr 0.005 |
+| `<best>_precipe` | both |
+
+`<best>` is `cross_par_l0_cycle_pedge_fourier_k3` on ETTm1, `patch8_cycle_once_fourier_full` on ETTm2 and `patch8_cycle_once_fourier_k3` on Weather.
+
+Reimplemented published models (`baselines.py`, trained in our pipeline with their own published settings and sized like our models; see EXPERIMENTS.md):
+
+| Variant | Model |
+|---|---|
+| `cyclenet_linear` | CycleNet/Linear, as the official code |
+| `cyclenet_mlp128` | CycleNet/MLP with 128 hidden units (the paper: 512) |
+| `pamnet_d32_a0.05` / `_a0.35` / `_a0.2` | PAMNet with d = 32 (the paper: 512) and dropout 0.1, lr 0.005, the frequency-loss weight chosen on validation for ETTm1 / ETTm2 / Weather |
+
+```bash
+python demo/run_benchmarks.py --datasets ETTm1 ETTm2 Weather --pred-lens 96 192 336 720 --variants cyclenet_linear cyclenet_mlp128 pamnet_d32_a0.05 pamnet_d32_a0.35 pamnet_d32_a0.2
+```
+
+Round 20, the default sweep (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+
+| Variant | Change |
+|---|---|
+| `cross_par_l0_cycle_pedge_fourier_k3` | the best ETTm1 model of round 19, now also on ETTm2 and Weather |
+| `cross_par_l0_cycle_pedge2_fourier_k3` | the same with 2 harmonics for the phase-dependent edges instead of 4; ETTm1 only |
+| `cross_par_l0_cycle_pedge8_fourier_k3` | the same with 8 harmonics; ETTm1 only |
+
+Round 19 (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+
+| Variant | Change |
+|---|---|
+| `cross_par_l0_cycle_fourier_full` | `cross_par_l0_cycle` with `--cycle-harmonics -1`: the cycle in the frequency domain with every harmonic |
+| `cross_par_l0_cycle_fourier_k3` | the same with 3 harmonics |
+| `cross_par_l0_cycle_pedge_fourier_k3` | `cross_par_l0_cycle_pedge_fourier` with the 3-harmonic cycle; ETTm1 only |
+| `cross_fused_own_mlp_cycle` | `cross_fused_mlp_cycle` with `--fused-own`: each signal's own encoded tokens are added to the fused memory |
+
+Round 18 (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+
+| Variant | Change |
+|---|---|
+| `patch8_cycle_once_fourier_full` | `patch8_cycle_once` with `--cycle-harmonics -1`: the cycle is described by a constant and the cosine and sine coefficients of every harmonic of its period (frequency domain) and evaluated at each step; it spans the same cycles as the table |
+| `patch8_cycle_once_fourier_k8` | the same with the first 8 harmonics only (a smooth cycle, 17 numbers per signal instead of 96 or 144) |
+| `patch8_cycle_once_fourier_k3` | the same with the first 3 harmonics |
+| `patch8_cycle_once_fourier_k8_weekly` | `_k8` with `--cycle-weekly 8`: 8 harmonics of a week (7 cycle lengths) added to the daily ones; ETTm1 and ETTm2 only |
+| `cross_par_l0_cycle_pedge_fourier` | `cross_par_l0_cycle_pedge` with `--phase-harmonics 4`: the phase offsets of every edge are 4 harmonics of the cycle instead of one offset per phase (392 parameters on ETTm, 3,528 on Weather, instead of 4,704 and 63,504) |
+| `cross_fused_mlp_cycle` | the Cross Transformer with `--cross-fused mlp` and the cycle: at each position the encoded tokens of all signals are concatenated and projected by one layer (C x d -> d, then GELU) to one memory that every signal's decoder cross-attends to, instead of the complete graph of edges |
+
+Round 17 (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
+
+| Variant | Change |
+|---|---|
+| `cross_par_l0_cycle_pedge` | `cross_par_l0_cycle` with `--phase-edges`: a learnable W x C x C table (W = the cycle length) adds an offset to the edge gates at the phase of every forecast step, so how much each signal reads every other one changes with the time of day (as TQNet's periodic queries); the L0 masks stay shared by all phases and the offsets start at zero |
+| `cross_par_l0_cycle_e2d2` | `cross_par_l0_cycle` with two encoder and two decoder layers |
+| `cross_par_l0_cycle_e2d2_shared` | `cross_par_l0_cycle_e2d2` with `--share-layers`: the two encoder layers share all weights, and so do the two decoder layers, so it has the parameters of `cross_par_l0_cycle` |
+
+Round 16 (ETTm1, ETTm2 and Weather at horizons 96, 192, 336 and 720):
 
 | Variant | Change |
 |---|---|
@@ -199,3 +257,27 @@ python demo/train.py --dataset ETTm1 --epochs 1 --max-steps 2
 - **Moving-average windows.** The default `--ma-windows 4,16,48` is sized for `--seq-len 96`. The first `max(windows) − 1` steps of each input use incomplete windows, so raise the input length (e.g. `--seq-len 336`) before using longer windows.
 - **Compare against baselines.** Published DLinear and PatchTST results on the same split are the reference points. A model that does not beat them is not yet useful.
 - **Ablations.** Useful comparisons are `--conv-stride 1` vs patching, `--no-cross-channel`, different `--n-rank`, and `--gate-lambda 0` (gate without sparsity pressure).
+
+## Taiwan stocks: return forecasts with news (`stock_model.py`)
+
+These scripts build the data, the features and the walk-forward experiments of the stock models in `stock_model.py` (see the main README). The data are not part of this repository: the market data, the downloaded announcements and news, and every score or embedding derived from them stay in the git-ignored `dataset/` at the repository root. The fetchers download only from public, keyless endpoints, or with the user's own free API keys read from a `keys/` directory outside the repository. They pause between requests and follow each site's robots.txt and terms. Check those terms before using or redistributing anything they download.
+
+| Step | Scripts |
+|---|---|
+| Data | `fetch_overnight.py` (US session: TSM / UMC / ASX ADRs, SOX, Nasdaq futures), `fetch_news.py` (MOPS material announcements, cnyes news), `fetch_intl.py`, `fetch_peers.py` (US / Japanese / Korean peers: prices, EDGAR filings, Alpaca news), `fetch_local_news.py` (TDnet, KIND, OpenDART, Korea Herald), `fetch_politics.py` (Federal Register, Truth Social archive, PRC MFA, MAC, korea.kr, GDELT events), `fetch_profiles.py` (company profiles), `fetch_mass_news.py` (SETN, LTN, ETtoday, China Times by article id or sitemap), `fetch_taifex.py` (futures-exchange daily reports, put/call ratios, large traders) |
+| Features | `stock_poly.py` (prices, multi-window polynomial fits), `stock_extra.py` (daily range), `stock_overnight.py`, `stock_recurrent.py` (`base_features`: the 52 base features) |
+| Stage 1 | `stock_walkforward.py` (walk-forward ridge), `stock_news_gap.py` (news-predicted opening gap) |
+| Comparison models | `stock_poly.py` (multi-window polynomial ridge), `stock_bilinear.py` (bilinear least squares over signals and lags), `stock_diffeq.py`, `stock_diffeq_pool.py`, `stock_diffeq_block.py`, `stock_diffeq_stride.py`, `stock_diffeq_order.py` (difference equations fitted per window, pooled, on block means) |
+| News | `news_score.py` (LLM direction probabilities, bge-m3 embeddings), `news_struct.py` (typed fields with `TypedForm`), `news_summary.py` (comparison of local LLMs), `news_probe.py` (what one item's representations predict), `stock_news.py` (daily text features) |
+| Stage 2 | `stock_news_attn.py`, `stock_news_attn2.py` (text-queried attention; shared splits and reports), `stock_itrans_news.py` (`StockNewsAttention`, all four modes) |
+| Spillover and US relation | `stock_id_probe.py` (which stock embedding routes other stocks' news), `stock_identity_news.py` (`StockIdentityAttention`), `news_struct_us.py` (typed fields of US news), `stock_us_relation.py`, `stock_us_variants.py` (signed relation to US stocks, pre-open information) |
+| Sign score | `stock_score_gap.py`, `stock_score_calendar.py`, `stock_score_loss.py` (score-aligned losses), `stock_score_set.py`, `stock_score_target.py`, `stock_score_itoken.py` (set model over the day's stocks; the current best model), `stock_score_news.py` (news tokens), `stock_score_taifex.py` (futures-exchange features) |
+
+Every experiment is walk-forward: year Y (2022–2026) is forecast by models fitted on the years before Y, and every choice (ridge penalty, number of training steps) is made on Y − 1 from the fit on the years before it. Results and their discussion are in `EXPERIMENTS.md`.
+
+```bash
+python demo/stock_walkforward.py                    # the ridge
+python demo/stock_news_gap.py                       # + the opening-gap block
+python demo/stock_itrans_news.py sigval             # stage 2, one of stockq | newsq | sigval | itemq
+HF_HOME=<models> python demo/news_struct.py --batch 12   # typed fields for every news item (Qwen3.5-4B)
+```

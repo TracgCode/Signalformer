@@ -271,9 +271,20 @@ These scripts build the data, the features and the walk-forward experiments of t
 | News | `news_score.py` (LLM direction probabilities, bge-m3 embeddings), `news_struct.py` (typed fields with `TypedForm`), `news_summary.py` (comparison of local LLMs), `news_probe.py` (what one item's representations predict), `stock_news.py` (daily text features) |
 | Stage 2 | `stock_news_attn.py`, `stock_news_attn2.py` (text-queried attention; shared splits and reports), `stock_itrans_news.py` (`StockNewsAttention`, all four modes) |
 | Spillover and US relation | `stock_id_probe.py` (which stock embedding routes other stocks' news), `stock_identity_news.py` (`StockIdentityAttention`), `news_struct_us.py` (typed fields of US news), `stock_us_relation.py`, `stock_us_variants.py` (signed relation to US stocks, pre-open information) |
-| Sign score | `stock_score_gap.py`, `stock_score_calendar.py`, `stock_score_loss.py` (score-aligned losses), `stock_score_set.py`, `stock_score_target.py`, `stock_score_itoken.py` (set model over the day's stocks; the current best model), `stock_score_news.py` (news tokens), `stock_score_taifex.py` (futures-exchange features) |
+| Sign score | `stock_score_gap.py`, `stock_score_calendar.py`, `stock_score_loss.py` (score-aligned losses), `stock_score_set.py`, `stock_score_target.py`, `stock_score_itoken.py` (set model over the day's stocks; part `final2` is the current best model, part `premask` the same with a pre-open attention mask), `stock_score_fast.py` (the same model with all seeds trained as one batched network, about 11 times faster), `stock_score_profile.py` (time of every stage), `stock_score_news.py` (news tokens), `stock_score_taifex.py` (futures-exchange features), `stock_score_rps.py` (quintile probabilities and RPS, a volatility forecast), `stock_score_panel.py` (extra daily columns from a private panel file) |
 
 Every experiment is walk-forward: year Y (2022–2026) is forecast by models fitted on the years before Y, and every choice (ridge penalty, number of training steps) is made on Y − 1 from the fit on the years before it. Results and their discussion are in `EXPERIMENTS.md`.
+
+The current best model is the d 32 soft-Score set model with 40 seeds (+18.2e-4 ± 2.1e-4 walk-forward 2022–2026, +3.5e-4 ± 1.1e-4 over the MSE ridge; see the main README for its inputs, layers and training). To run it:
+
+```bash
+mkdir -p demo/runs
+python demo/fetch_overnight.py                      # ADRs, SOX, Nasdaq futures, Nikkei, KOSPI, TWD and TAIEX futures
+python demo/stock_score_fast.py check               # the best model, 40 seeds batched, about 2 min on one GPU
+python demo/stock_score_itoken.py final2            # the same, one network per seed (with d 16 / d 128 variants)
+```
+
+Earlier stages:
 
 ```bash
 python demo/stock_walkforward.py                    # the ridge

@@ -128,9 +128,76 @@ net = StockIdentityAttention(n_stocks=100, window_dim=60 * 4, n_features=56, ide
 e_hat = net(win, cur, news, tags)   # win (B, 100, 240), cur (B, 100, 56), news (B, N, 20), tags (B, N) -> (B, 100)
 ```
 
-The data pipeline, the experiments and their results are in `demo/` (`demo/README.md`, `demo/EXPERIMENTS.md`, sections from "Walk-forward ridge without a fixed α" on). The market data, the news texts and the scores derived from them are not part of this repository. Walk-forward results, pooled over 2022–2026 for 100 stocks; score = mean of sign(forecast) × return, with standard errors clustered by day:
+The data pipeline, the experiments and their results are in `demo/` (`demo/README.md`, `demo/EXPERIMENTS.md`). The market data, the news texts and the scores derived from them are not part of this repository.
 
-| Model | Features | R² | Score |
+### Current best model: the d 32 soft-Score set model
+
+The best forecast of the sign of every stock's open-to-close return r = (close − open) / open is a small Transformer over the stocks of one day, trained directly on the sign score. It is defined in `demo/stock_score_itoken.py` (part `final2`), and a faster trainer for it is in `demo/stock_score_fast.py`.
+
+- **Inputs, per stock and day (55), all known before the 09:00 open:**
+  - **52 base features** (`stock_recurrent.base_features`):
+    - degree-0 multi-window polynomial readouts of the stock's open-to-close returns, overnight gaps and cumulative price path, and of the Nasdaq, S&P 500 and TAIEX;
+    - the daily range log(high / low) and its moving averages;
+    - 5 US-session features: TSM ADR, SOX and Nasdaq-futures returns, the change of the TSM ADR premium, and the stock's own ADR return for 2330 / 2303 / 3711.
+  - **The gap block (3):** ĝ_pre, |ĝ_pre| and its day mean.
+    - ĝ_pre is a pooled walk-forward ridge forecast of the opening gap.
+    - It uses the 52 features plus 4 pre-open inputs: the Nikkei and KOSPI opening gaps at 08:00, the TAIEX futures gap at 08:45, and that gap times the stock's 60-day gap beta.
+- **Network:**
+  - Linear(55 → 32) + GELU;
+  - one pre-norm Transformer encoder layer over the day's stocks: 4 heads, feed-forward 64, dropout 0.2, with untraded stocks masked as keys;
+  - Linear(32 → 1).
+  - 10,369 parameters.
+- **Loss:** soft score, −Σ tanh(f) r / Σ |r| over the day's usable stocks; a smooth version of the sign score.
+- **Training:**
+  - AdamW, learning rate 1e-3, weight decay 1e-2, batches of 16 days;
+  - the epoch count is chosen on year Y − 1 by early stopping (patience 3, at most 40);
+  - the network is then refit from scratch on all years before Y;
+  - 40 seeds, whose raw outputs are summed;
+  - the forecast is up if the sum is positive.
+
+Walk-forward 2022–2026, 100 stocks (112,853 stock-days). Sign score = mean of sign(forecast) × r; differences are paired and their standard errors clustered by day:
+
+| Model | Sign score (100 stocks) | − MSE ridge | Sign score (50-stock subset) |
+|---|---|---|---|
+| always down (trivial baseline) | +7.8e-4 ± 2.4e-4 | −6.8e-4 ± 2.6e-4 | +3.4e-4 ± 2.3e-4 |
+| MSE ridge on the same 55 inputs | +14.7e-4 ± 2.0e-4 | 0 | +11.0e-4 ± 1.9e-4 |
+| **d 32 soft-Score set model, 40 seeds** | **+18.2e-4 ± 2.1e-4** | **+3.5e-4 ± 1.1e-4** | **+14.7e-4 ± 1.9e-4** |
+
+- **Per year:** the set model scores +18.3e-4, +12.6e-4, +15.1e-4, +16.9e-4 and +32.9e-4 in 2022–2026, above the ridge in every year.
+- **Checks:**
+  - An attention mask built only from pre-open information gives the same result (+0.3e-4 ± 0.2e-4).
+  - The fast trainer reproduces it (−0.2e-4 ± 0.2e-4, 1.6 min instead of about 18 min).
+- **Tested and not adopted:** news tokens, futures-exchange data, margin / securities-lending / shareholding columns, gradient-boosted trees and post-hoc ensembles. Each was paired with this model, at 40 seeds where it mattered (`demo/EXPERIMENTS.md`, section E4).
+
+### Running it
+
+The scripts expect a git-ignored `dataset/` at the repository root (not distributed):
+
+| Path | Content |
+|---|---|
+| `dataset/info.json` | `Top100@Y` (the 100 stocks) and `Top50@Y` (the 50-stock subset) |
+| `dataset/market/<id>.csv` | daily `date`, `etl:adj_open`, `etl:adj_high`, `etl:adj_low`, `etl:adj_close` (adjusted prices), … per stock |
+| `dataset/global/global_data.csv` | daily `^IXIC`, `^GSPC`, `^TWII`, … |
+| `dataset/overnight/` | `yahoo_TSM.csv`, `yahoo_UMC.csv`, `yahoo_ASX.csv`, `yahoo_SOX.csv`, `yahoo_NQ_F.csv`, `yahoo_TWD_X.csv`, `yahoo_N225.csv`, `yahoo_KS11.csv` and `taifex_tx.csv`, made by `python demo/fetch_overnight.py` |
+
+```bash
+pip install numpy pandas torch
+mkdir -p demo/runs
+python demo/fetch_overnight.py                 # ADRs, SOX, Nasdaq futures, Nikkei, KOSPI, TWD (Yahoo) and TAIEX futures (TAIFEX)
+python demo/stock_score_fast.py check          # the best model, 40 seeds batched on one GPU, about 2 min
+python demo/stock_score_itoken.py final2       # the same with one network per seed, plus d 16 / d 128 variants (the original run)
+python demo/stock_score_itoken.py premask      # the same with a pre-open attention mask
+```
+
+- Each run prints the walk-forward table (the sign score with day-clustered standard errors, paired differences against the MSE ridge, the 50-stock subset, per year).
+- Each run saves the forecasts of 2022–2026 to `demo/runs/*.npz`.
+- `demo/stock_score_profile.py` times every stage of one fold.
+
+### Earlier models
+
+Walk-forward results of the earlier ridge and residual-network stages, pooled over 2022–2026 for 100 stocks, with standard errors clustered by day:
+
+| Model | Features | R² | Sign score |
 |---|---|---|---|
 | always down (trivial baseline) | — | — | +7.8e-4 ± 2.4e-4 |
 | multi-window polynomial ridge, degrees ≤ 3 (`demo/stock_poly.py`) | 230 | +0.0040 | +10.5e-4 ± 2.0e-4 |
@@ -145,7 +212,7 @@ The data pipeline, the experiments and their results are in `demo/` (`demo/READM
 
 The bilinear model (`demo/stock_bilinear.py`: r̂ = b₀ + Σₖ uₖᵀ Z vₖ over the last L days Z of 6 daily signals, with polynomial lag filters) was evaluated on one fixed split (train 2020–2023, validation 2024, test 2025–2026-08) rather than walk-forward. There, its cubic rank-2 version on 20 lags has 20 parameters and a test score of +16.9e-4, against +16.3e-4 for the 230-feature polynomial ridge and +11.0e-4 for always down.
 
-The rows of the main table differ slightly in their sample (the feature sets start on different days), so compare scores across rows only as rough levels; the sections of `demo/EXPERIMENTS.md` give paired differences on common samples. The networks do not beat the ridge yet. `StockIdentityAttention` has not been evaluated.
+The rows of this table differ slightly in their sample (the feature sets start on different days, and the gap block of these rows used an earlier gap forecast without the pre-open inputs), so compare them only as rough levels. The residual networks on the ridge did not beat the ridge; the gain came when the network predicts r directly with the soft-score loss (above). `StockIdentityAttention` was evaluated in E2j (`demo/EXPERIMENTS.md`) and did not help.
 
 ## Documentation
 

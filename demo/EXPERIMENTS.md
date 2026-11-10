@@ -2489,7 +2489,7 @@ E2i on g − ĝ_pre: no similarity carries the direction of other stocks' news (
 
 ## E4: raising the sign score
 
-From here on the goal is the Score itself: the mean of sign(μ) × r, with r the open-to-close log return. The reference is the return ridge of E2j step 0 with ĝ_pre: the 52 base features plus the gap block of ĝ_pre (+14.7e-4 on all 100 stocks).
+From here on the goal is the Score itself: the mean of sign(μ) × r, with r the open-to-close return (close − open) / open (a simple return, `stock_poly.load`). The reference is the return ridge of E2j step 0 with ĝ_pre: the 52 base features plus the gap block of ĝ_pre (+14.7e-4 on all 100 stocks).
 
 ### E4a: the parts of the gap forecast as separate inputs (`demo/stock_score_gap.py`)
 
@@ -3153,3 +3153,182 @@ Set-model part: the d 32 soft-Score set model (E4j final2 recipe), 10 seeds 0..9
 - **The per-stock SSF features help a little:** +1.2e-4 ± 0.7e-4 over the same seeds without them (1.7 SE), +1.8e-4 ± 0.7e-4 on the 50-stock subset and +1.5e-4 ± 0.7e-4 on the stocks that have an SSF; the gain comes from 2022–2024 (2025–2026: −0.5e-4 ± 1.2e-4). The features in the gap ridge only give +1.0e-4 ± 0.6e-4.
 - The SSF open adds nothing to the Score, in the inputs or in ĝ_pre.
 - Round r2 (`stock_score_taifex.py r2`) repeats the SSF-only variants with 40 seeds.
+
+#### E4m r2: the per-stock SSF features with 40 seeds (`demo/stock_score_taifex.py r2`)
+
+The market features dropped; the SSF features in the set model's inputs, in the gap ridge of ĝ_pre, or both; 40 seeds 0..39, paired. The 40-seed set base reproduces the E4j final2 model exactly (+18.2e-4).
+
+| Model | Score (100) | − ridge | − set base | Score (50) | 2022 | 2023 | 2024 | 2025 | 2026 | up share |
+|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 | 0.000 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 | |
+| ridge + SSF | +15.2e-4 ± 2.0e-4 | +0.5e-4 ± 0.4e-4 | | +11.5e-4 | +14.1e-4 | +9.1e-4 | +15.4e-4 | +17.0e-4 | +22.8e-4 | |
+| ridge, ĝ_pre with SSF | +14.7e-4 ± 2.0e-4 | +0.1e-4 ± 0.1e-4 | | +11.1e-4 | +14.1e-4 | +7.8e-4 | +14.4e-4 | +17.0e-4 | +23.2e-4 | |
+| set base, 40 seeds | +18.2e-4 ± 2.1e-4 | +3.5e-4 ± 1.1e-4 | 0 | +14.7e-4 | +18.3e-4 | +12.6e-4 | +15.1e-4 | +16.9e-4 | +32.9e-4 | 0.453 |
+| set + SSF | +18.6e-4 ± 2.0e-4 | +4.0e-4 ± 1.1e-4 | +0.4e-4 ± 0.5e-4 | +15.6e-4 | +19.0e-4 | +13.1e-4 | +17.0e-4 | +17.5e-4 | +30.4e-4 | 0.463 |
+| set, ĝ_pre with SSF | +18.3e-4 ± 2.1e-4 | +3.6e-4 ± 1.1e-4 | +0.1e-4 ± 0.3e-4 | +14.8e-4 | +17.9e-4 | +12.4e-4 | +15.6e-4 | +17.7e-4 | +32.8e-4 | 0.453 |
+| set + SSF, ĝ_pre with SSF | +18.2e-4 ± 2.1e-4 | +3.5e-4 ± 1.2e-4 | −0.0e-4 ± 0.7e-4 | +15.8e-4 | +15.6e-4 | +13.1e-4 | +16.5e-4 | +17.7e-4 | +33.0e-4 | 0.476 |
+| set + SSF, ĝ_pre with SSF + SSF open | +18.2e-4 ± 2.0e-4 | +3.6e-4 ± 1.1e-4 | +0.1e-4 ± 0.6e-4 | +15.8e-4 | +16.1e-4 | +13.5e-4 | +16.9e-4 | +17.4e-4 | +31.8e-4 | 0.474 |
+
+- **With 40 seeds the SSF gain shrinks to +0.4e-4 ± 0.5e-4** (10 seeds: +1.2e-4 ± 0.7e-4). On the 50-stock subset it is +0.9e-4 ± 0.6e-4, and the cross-sectional part rises from +5.1e-4 to +6.1e-4; the features carry a little within-day information but not enough to change the candidate.
+- Putting the SSF features into ĝ_pre adds nothing (+0.1e-4 ± 0.3e-4), and both together add nothing either.
+- The futures-exchange data close as: market-level features harmful, per-stock SSF features at most a small cross-sectional gain within one SE. The d 32 soft-Score set model without them stays the candidate.
+
+### Performance profile of the best model (`demo/stock_score_profile.py`)
+
+Fold Y = 2026 (the largest training set: 1,155 selection days, 1,398 refit days, 139,750 refit stock-days, 159 test days), 3 seeds, RTX 5090 shared with other jobs, torch 2.14.1.
+
+| Stage | Time |
+|---|---|
+| prices, 52 base features, pre-open features | 0.2 s, 0.5 s, 1.3 s |
+| the two ĝ_pre gap ridges | 0.9 s |
+| MSE ridge (α, out-of-sample μ) | 1.5 s |
+| input tensors to the GPU | 0.2 s |
+| selection fit per seed (early stopping, 6–9 epochs of 73 steps) | 2.1–4.7 s; 0.24–0.64 s per epoch, 3–9 ms per step |
+| refit per seed (3–6 epochs of 88 steps) | 0.3–3.9 s; 0.11–0.65 s per epoch, 1.3–7.4 ms per step |
+| forecast of the 159 test days, one network | 1–3 ms |
+| one day (100 stocks), one network, GPU / CPU | 0.17 ms / 0.17 ms (40 seeds ≈ 7 ms) |
+
+- The model has 10,369 trained parameters (Linear 55→32: 1,792; encoder layer: 8,544; head: 33) and its training peaks at 161 MiB of GPU memory.
+- **The GPU is almost idle.** Over 50 training steps the CUDA kernels take 17.5 ms in all, the host 1.69 s: about 1% of the step time is GPU work. The step time is launch overhead (about 118 kernel launches per step) and host-device synchronizations: the boolean masks `f[m]`, `y[m]` call `nonzero`, which waits for the GPU three times per step. The spread of the per-epoch times between seeds (factor 2–3) is contention with the other jobs on the machine, not the model.
+- The full final2 run (5 folds × 40 seeds, 1,618 selection and 1,018 refit epochs from its log) needs at most about 18 min of training at the fold-2026 rates; the data stages take about 5 s per fold.
+- Speed-ups that keep the results: train the 40 seeds as one batched model (`torch.func.stack_module_state` + `vmap`, or 40 copies in one wider batch), since one network uses about 1% of the GPU; replace the boolean indexing in the loss by a masked sum (no synchronization); CUDA graphs or `torch.compile` for the fixed-shape step.
+
+### E4n: quintile probabilities (RPS) walk-forward, a set model trained on the RPS, and σ̂ in the sign-score set model (`demo/stock_score_rps.py`)
+
+The single-split RPS test of `demo/stock_rps.py` redone walk-forward (2022–2026). Each day, the usable stocks are ranked by r and split into five equal groups. A forecast gives every stock-day five probabilities and is scored by RPS = 1/5 Σ_j (F_j − C_j)², where F and C are cumulative; uniform ≈ 0.16 and lower is better. Gains are uniform minus RPS, paired and day-clustered.
+
+- **σ̂:** the Garman-Klass variance forecast, refit walk-forward. Its inputs are the HAR terms (1, 5 and 22 days) and the pre-open gaps squared (Nikkei, KOSPI and the 08:45 futures, in place of the stock's own gap, which is only known at 09:00). It also uses VIX, the TAIEX volatility, the day mean of log RV and the relative volume. Walk-forward QLIKE 2022–2026: constant 0.791, EWMA 0.351, HAR 0.347, full model 0.334.
+- **Part A:** r_i = κ μ_i + s_i ε_i with s_i = s̄ (σ̂_i / s̄)^γ. The ε are day-demeaned standardized training residuals. Probabilities are Monte Carlo over the day's cross-section, with each stock's CDF taken at the simulated quintile thresholds. κ and γ are chosen on Y − 1. The set-model μ is z-scored within the day and scaled by the slope of the day-demeaned r on it in Y − 1. For 2022 the slope comes from 2021 forecasts of a model fitted on 2020; it came out negative, so 2022 is poor for "set μ".
+- **Part B:** the d 32 set model with 5 logits per stock and a softmax, trained on the mean RPS. Variants:
+  - B1: the 55 inputs;
+  - B2: 55 + log σ̂ and its deviation from the day mean;
+  - B3: B2 with an auxiliary soft-Score head, loss RPS + 0.1 soft Score.
+
+  Epochs are chosen on Y − 1; 10 seeds, probabilities averaged.
+
+| Forecast | RPS (100) | Gain vs uniform | − σ̂ only | − ridge μ + σ̂ | Gain (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| *Uniform* | *0.15998* | *0* | | | *0* | | | | | |
+| σ̂ only | 0.15614 | +38.4e-4 ± 1.0e-4 | 0 | −5.8e-4 ± 1.2e-4 | +36.6e-4 | +35.7e-4 | +52.0e-4 | +38.4e-4 | +30.6e-4 | +34.2e-4 |
+| ridge μ only | 0.15913 | +8.5e-4 ± 1.5e-4 | −29.9e-4 ± 1.5e-4 | −35.7e-4 ± 0.9e-4 | +8.8e-4 | +3.6e-4 | +13.2e-4 | +14.5e-4 | +4.1e-4 | +6.8e-4 |
+| ridge μ + σ̂ | 0.15556 | +44.2e-4 ± 1.7e-4 | +5.8e-4 ± 1.2e-4 | 0 | +42.6e-4 | +38.6e-4 | +59.9e-4 | +47.5e-4 | +35.6e-4 | +37.5e-4 |
+| set μ only | 0.15931 | +6.7e-4 ± 1.3e-4 | −31.7e-4 ± 1.5e-4 | −37.5e-4 ± 1.4e-4 | +6.3e-4 | −10.0e-4 | +14.7e-4 | +15.5e-4 | +8.0e-4 | +5.2e-4 |
+| set μ + σ̂ | 0.15561 | +43.7e-4 ± 1.5e-4 | +5.3e-4 ± 1.0e-4 | −0.5e-4 ± 0.8e-4 | +42.2e-4 | +33.4e-4 | +60.8e-4 | +48.5e-4 | +37.0e-4 | +36.8e-4 |
+| B1: set model trained on the RPS, 55 inputs | 0.15518 | +48.0e-4 ± 1.9e-4 | +9.6e-4 ± 1.6e-4 | +3.8e-4 ± 1.1e-4 | +46.8e-4 | +40.5e-4 | +62.4e-4 | +55.5e-4 | +39.5e-4 | +39.6e-4 |
+| **B2: trained on the RPS, 55 + σ̂** | **0.15506** | **+49.2e-4 ± 2.0e-4** | +10.8e-4 ± 1.7e-4 | **+5.0e-4 ± 1.1e-4** | +48.1e-4 | +42.8e-4 | +61.5e-4 | +56.4e-4 | +40.6e-4 | +42.9e-4 |
+| B3: B2 + aux soft-Score head | 0.15531 | +46.7e-4 ± 1.8e-4 | +8.3e-4 ± 1.5e-4 | +2.5e-4 ± 1.0e-4 | +45.0e-4 | +38.9e-4 | +60.8e-4 | +54.6e-4 | +39.4e-4 | |
+
+On 2023–2026 only (where the set-model scale comes from its own out-of-sample Y − 1), set μ + σ̂ is +0.8e-4 ± 0.6e-4 over ridge μ + σ̂: the two are tied either way. B2 is +1.2e-4 ± 0.3e-4 over B1, and B3 is −1.3e-4 ± 0.5e-4 vs B1.
+
+Sign score of signs derived from the B models, and part C (σ̂ as an input of the d 32 soft-Score set model, 10 seeds 0..9, paired):
+
+| Model | Sign score (100) | − ridge | − d 32 set model, 40 seeds | Sign score (50) | Up share |
+|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | *−10.4e-4 ± 2.7e-4* | *+3.4e-4* | 0.000 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | −3.5e-4 ± 1.1e-4 | +11.0e-4 | 0.376 |
+| d 32 set model, 40 seeds | +18.2e-4 ± 2.1e-4 | +3.5e-4 ± 1.1e-4 | 0 | +14.7e-4 | 0.453 |
+| B2: E[q] − 3 (within-day ranking only) | +14.4e-4 ± 1.4e-4 | −0.2e-4 ± 1.5e-4 | −3.7e-4 ± 1.6e-4 | +12.1e-4 | 0.523 |
+| B2: E[q] − 3 + the set model's market tilt | +18.5e-4 ± 2.1e-4 | +3.8e-4 ± 1.2e-4 | +0.3e-4 ± 0.4e-4 | +14.7e-4 | 0.457 |
+| B3: aux soft-Score head | +17.4e-4 ± 2.1e-4 | +2.8e-4 ± 1.2e-4 | −0.7e-4 ± 0.7e-4 | +14.3e-4 | 0.482 |
+| C: set base, 10 seeds | +17.3e-4 ± 2.1e-4 | +2.6e-4 ± 1.1e-4 | (vs set base) 0 | +14.0e-4 | 0.461 |
+| C: set + σ̂, 10 seeds | +18.1e-4 ± 2.1e-4 | +3.4e-4 ± 1.1e-4 | (vs set base) +0.8e-4 ± 0.7e-4 | +14.4e-4 | 0.465 |
+
+- **For the RPS, the set model trained on the RPS with σ̂ (B2) is the best forecast:** +49.2e-4 ± 2.0e-4 over uniform, +5.0e-4 ± 1.1e-4 over ridge μ + σ̂. It is ahead in every year except 2023, where B1 leads by 0.9e-4. The early single-split result (+38.4e-4 for the best ridge) is beaten by the walk-forward σ̂ alone.
+- **Most of the RPS gain is still the volatility.** σ̂ alone gives +38.4e-4; a mean forecast adds about +6e-4 to it. A set model that learns the quintiles directly adds another +5e-4, partly by learning the volatility from its own inputs: B1 without σ̂ already reaches +48.0e-4.
+- **Turning the set model's sign forecast into probabilities does not help.** set μ + σ̂ ties ridge μ + σ̂, because the RPS needs within-day ranks and widths, not the market direction that carries much of the sign score.
+- **The RPS models do not raise the sign score.** Their within-day ranking alone scores like the ridge (+14.4e-4), and with the set model's market tilt they tie the set model (+0.3e-4 ± 0.4e-4). σ̂ as an input of the sign-score model gives +0.8e-4 ± 0.7e-4 at 10 seeds, within noise.
+- Two candidates by metric: B2 for quintile probabilities (RPS); the d 32 soft-Score set model for the sign score.
+
+### E4j premask: the attention context from pre-open information only (`demo/stock_score_itoken.py premask`)
+
+In final2, two things depend on whether each stock trades on day t and has r and the gap of t: which stocks enter the attention over the day, and the day mean in the gap block. Strictly, neither is known before 09:00. This variant builds both from the stocks known before the open instead: the features of t − 1 exist and the stock is past the first FIRST days. ĝ_pre is predicted on those rows too. The loss and the evaluation keep the usable rows. Only 51 of 155,700 pre-open stock-days are not usable; no usable row is missing from the pre-open set. The run uses 40 seeds, paired with final2.
+
+| Model | Sign score (100) | − ridge | − final2 | Sign score (50) | − final2 (50) | Calls flipped |
+|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | −3.5e-4 ± 1.1e-4 | +11.0e-4 | | |
+| E4j final2, usable-row mask | +18.2e-4 ± 2.1e-4 | +3.5e-4 ± 1.1e-4 | 0 | +14.7e-4 | 0 | |
+| pre-open mask | +18.4e-4 ± 2.1e-4 | | +0.3e-4 ± 0.2e-4 | +14.8e-4 | +0.1e-4 ± 0.2e-4 | 1.3% |
+
+The usable-row mask did not inflate the result. With the pre-open mask the score is the same within 0.3e-4, and 1.3% of the calls change. The pre-open mask is the strictly correct one and costs nothing, so it should be used from here on.
+
+### A faster trainer: all seeds as one batched model (`demo/stock_score_fast.py`)
+
+The profile showed that one network keeps the GPU about 1% busy. `stock_score_fast.py` therefore trains the K seeds of a run as K stacked copies of the d 32 set model, written as batched einsums.
+- **Same as before:** the layers of TokNet; each seed's initial weights (TokNet built after `torch.manual_seed(seed)`); each seed's order of training days; AdamW applied element-wise (the same update as one optimizer per seed); early stopping per seed; the refit to each seed's own epoch count; the forecast as the sum over the seeds.
+- **Different from before:** only the dropout masks.
+- **No synchronization per step:** the soft-Score loss uses masked sums instead of boolean indexing.
+
+Check against final2 (d 32, soft Score, 40 seeds, 5 folds). Training time: 1.6 min; whole run 1.8 min. The 2022 fold took 71 s including the warm-up; the other folds took 5–8 s each. The previous trainer needed about 18 min of training for the same run.
+
+| Model | Sign score (100) | − ridge | − final2 | Sign score (50) | − final2 (50) | Calls flipped |
+|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | −3.5e-4 ± 1.1e-4 | +11.0e-4 | | |
+| final2, one network per seed | +18.2e-4 ± 2.1e-4 | +3.5e-4 ± 1.1e-4 | 0 | +14.7e-4 | 0 | |
+| fast trainer, 40 seeds | +18.0e-4 ± 2.1e-4 | | −0.2e-4 ± 0.2e-4 | +14.5e-4 | −0.2e-4 ± 0.3e-4 | 2.3% |
+
+The fast trainer gives the same model within seed noise: −0.2e-4 ± 0.2e-4, with 2.3% of the calls flipped. Different dropout draws alone change about as many calls. The chosen epoch counts are close to those of final2, but not identical. From here on the variants use this trainer.
+
+### E4p: the columns of the user's panel file as extra inputs (`demo/stock_score_panel.py`)
+
+The panel file (`dataset/panel/panel.parquet`, private) has one row per stock and day, 2020-01-02 .. 2026-10-20. Each column of row d is known after the close of d.
+
+**Preparation**
+- **Shift:** every column is forward-filled within the stock and shifted by one trading day within the stock, so the forecast of day t sees the row of t − 1. The panel's r equals ours exactly (correlation 1.000000).
+- **Duplicates dropped:** the price, volume, institutional and technical-indicator columns (= `dataset/market`) and the `g_` market columns (= `dataset/global`). The first set is tested separately as "ohlc", made stationary.
+- **Groups added:**
+  - **shares (6):** log shares issued, turnover, institutional net buys / shares issued;
+  - **margin (29):** FinMind margin and short-sale counts / shares issued, usage and its change, maintenance, flags, estimated cost / close − 1;
+  - **sbl (10):** securities-lending short-sale counts / shares issued and ratios;
+  - **susp (2):** the short-sale suspension flag and the trading days to the forced cover;
+  - **hold (63):** the weekly shareholding distribution, 15 brackets: percent, log people, changes, update flags;
+  - **mkt (6):** log market margin and short balances and their changes.
+- **Cleaning:** each column is clipped at its pre-2021 0.5/99.5% quantiles, and missing values are set to the pre-2021 median. The model then standardizes on each fold's training rows as usual.
+
+**Test:** the d 32 soft-Score set model with 55 + the group's columns, 10 seeds 0..9, paired with the base at the same seeds.
+
+| Model | Sign score (100) | − ridge | − set base | Sign score (50) | − set base (50) | Up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | 0.376 | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| ridge + all six groups | +14.8e-4 ± 1.9e-4 | +0.2e-4 ± 0.6e-4 | | +11.7e-4 | | 0.377 | +15.3e-4 | +8.3e-4 | +14.3e-4 | +17.0e-4 | +21.6e-4 |
+| set base, 10 seeds | +17.3e-4 ± 2.1e-4 | +2.6e-4 ± 1.1e-4 | 0 | +14.0e-4 | 0 | 0.461 | +16.2e-4 | +12.3e-4 | +15.5e-4 | +16.7e-4 | +30.2e-4 |
+| + shares | +18.3e-4 ± 2.0e-4 | +3.7e-4 ± 1.3e-4 | +1.0e-4 ± 0.9e-4 | +15.5e-4 | +1.5e-4 ± 0.9e-4 | 0.440 | +16.3e-4 | +13.0e-4 | +15.9e-4 | +18.3e-4 | +33.1e-4 |
+| + margin | +17.9e-4 ± 2.1e-4 | +3.3e-4 ± 1.0e-4 | +0.6e-4 ± 0.8e-4 | +14.3e-4 | +0.4e-4 ± 0.8e-4 | 0.433 | +18.0e-4 | +13.6e-4 | +15.5e-4 | +17.9e-4 | +28.2e-4 |
+| + sbl | +18.5e-4 ± 2.1e-4 | +3.8e-4 ± 1.2e-4 | +1.2e-4 ± 0.7e-4 | +14.9e-4 | +0.9e-4 ± 0.8e-4 | 0.436 | +18.7e-4 | +11.6e-4 | +17.3e-4 | +16.8e-4 | +32.7e-4 |
+| + susp | +18.8e-4 ± 2.1e-4 | +4.2e-4 ± 1.2e-4 | +1.5e-4 ± 0.6e-4 | +15.8e-4 | +1.8e-4 ± 0.7e-4 | 0.452 | +17.8e-4 | +13.1e-4 | +15.7e-4 | +18.4e-4 | +34.5e-4 |
+| + hold | +16.2e-4 ± 2.0e-4 | +1.5e-4 ± 1.0e-4 | −1.1e-4 ± 1.0e-4 | +13.0e-4 | −0.9e-4 ± 1.0e-4 | 0.473 | +13.1e-4 | +12.2e-4 | +16.5e-4 | +14.7e-4 | +28.6e-4 |
+| + mkt | +15.5e-4 ± 2.2e-4 | +0.8e-4 ± 1.1e-4 | −1.8e-4 ± 1.1e-4 | +12.0e-4 | −2.0e-4 ± 1.1e-4 | 0.387 | +15.4e-4 | +11.2e-4 | +15.4e-4 | +13.1e-4 | +25.7e-4 |
+| + ohlc | +17.5e-4 ± 2.1e-4 | +2.8e-4 ± 1.2e-4 | +0.2e-4 ± 0.7e-4 | +14.1e-4 | +0.2e-4 ± 0.7e-4 | 0.446 | +15.6e-4 | +12.9e-4 | +15.5e-4 | +16.4e-4 | +32.0e-4 |
+| + all six groups | +17.5e-4 ± 2.0e-4 | +2.8e-4 ± 1.1e-4 | +0.2e-4 ± 1.2e-4 | +14.5e-4 | +0.6e-4 ± 1.2e-4 | 0.449 | +18.7e-4 | +12.3e-4 | +18.2e-4 | +14.8e-4 | +26.2e-4 |
+| + all + ohlc | +17.6e-4 ± 2.0e-4 | +3.0e-4 ± 1.0e-4 | +0.3e-4 ± 1.1e-4 | +14.3e-4 | +0.3e-4 ± 1.1e-4 | 0.458 | +17.8e-4 | +13.2e-4 | +17.1e-4 | +14.3e-4 | +30.0e-4 |
+
+- **The short-sale suspension (susp, 2 columns) gives the largest gain:** +1.5e-4 ± 0.6e-4 at 10 seeds (2.5 SE), +1.8e-4 ± 0.7e-4 on the 50-stock subset, and it is positive in 4 of 5 years. The sbl (+1.2e-4 ± 0.7e-4) and shares (+1.0e-4 ± 0.9e-4) groups point the same way.
+- **The market-level group hurts** (mkt −1.8e-4 ± 1.1e-4), as did the futures-exchange market features (E4m). The weekly shareholding distribution hurts too (−1.1e-4 ± 1.0e-4): 63 slow columns add noise.
+- **All groups together give nothing** (+0.2e-4 ± 1.2e-4): the harmful and wide groups cancel the useful ones.
+- The ridge does not gain from the panel (+0.2e-4 ± 0.6e-4). The 10-seed gains of E4m (+1.2e-4) fell to +0.4e-4 at 40 seeds, so the promising groups are rechecked with 40 seeds (part fast40).
+
+#### E4p fast40 and confirm: 40 seeds with the batched trainer, then 40 new seeds (`stock_score_panel.py fast40 [confirm]`)
+
+Each variant is paired with the base trained the same way (batched trainer, same seeds).
+
+| Model | Seeds | Sign score (100) | − ridge | − set base | Sign score (50) | − set base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set base | 0..39 | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | +14.5e-4 | 0 | +18.9e-4 | +12.0e-4 | +15.1e-4 | +16.5e-4 | +32.2e-4 |
+| + susp | 0..39 | +17.9e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | −0.1e-4 ± 0.5e-4 | +14.7e-4 | +0.1e-4 ± 0.5e-4 | +15.6e-4 | +13.2e-4 | +16.0e-4 | +16.8e-4 | +33.0e-4 |
+| + sbl | 0..39 | +17.7e-4 ± 2.0e-4 | +3.0e-4 ± 1.1e-4 | −0.3e-4 ± 0.5e-4 | +14.2e-4 | −0.3e-4 ± 0.5e-4 | +15.3e-4 | +11.0e-4 | +16.9e-4 | +16.7e-4 | +34.2e-4 |
+| + shares | 0..39 | +18.2e-4 ± 2.1e-4 | +3.6e-4 ± 1.1e-4 | +0.2e-4 ± 0.5e-4 | +14.9e-4 | +0.3e-4 ± 0.6e-4 | +17.1e-4 | +12.3e-4 | +14.9e-4 | +18.4e-4 | +33.7e-4 |
+| + margin | 0..39 | +17.8e-4 ± 2.1e-4 | +3.2e-4 ± 1.0e-4 | −0.2e-4 ± 0.7e-4 | +14.0e-4 | −0.5e-4 ± 0.7e-4 | +16.3e-4 | +12.9e-4 | +15.6e-4 | +19.1e-4 | +29.0e-4 |
+| + susp + sbl | 0..39 | +18.6e-4 ± 2.0e-4 | +4.0e-4 ± 1.0e-4 | +0.6e-4 ± 0.6e-4 | +15.2e-4 | +0.7e-4 ± 0.6e-4 | +17.5e-4 | +13.1e-4 | +17.7e-4 | +15.6e-4 | +34.6e-4 |
+| + susp + sbl + shares | 0..39 | +19.5e-4 ± 2.0e-4 | +4.8e-4 ± 1.2e-4 | +1.5e-4 ± 0.5e-4 | +16.3e-4 | +1.8e-4 ± 0.6e-4 | +19.5e-4 | +12.4e-4 | +17.2e-4 | +18.2e-4 | +35.5e-4 |
+| + susp + sbl + shares + margin | 0..39 | +18.5e-4 ± 2.0e-4 | +3.8e-4 ± 1.0e-4 | +0.5e-4 ± 0.6e-4 | +15.2e-4 | +0.7e-4 ± 0.7e-4 | +19.2e-4 | +13.5e-4 | +16.2e-4 | +17.9e-4 | +29.0e-4 |
+| set base | 40..79 | +18.0e-4 ± 2.1e-4 | +3.4e-4 ± 1.1e-4 | 0 | +14.3e-4 | 0 | +17.3e-4 | +12.1e-4 | +15.1e-4 | +17.7e-4 | +32.9e-4 |
+| + susp + sbl + shares | 40..79 | +18.6e-4 ± 2.0e-4 | +4.0e-4 ± 1.2e-4 | +0.6e-4 ± 0.7e-4 | +15.6e-4 | +1.3e-4 ± 0.7e-4 | +16.2e-4 | +13.2e-4 | +16.7e-4 | +18.2e-4 | +34.1e-4 |
+
+- **Every single group falls to noise with 40 seeds** (−0.3e-4 to +0.2e-4); the 10-seed gains (+1.0e-4 to +1.5e-4) were seed noise, as in E4m.
+- **The union susp + sbl + shares** reaches +1.5e-4 ± 0.5e-4 on seeds 0..39. This is the best of 8 variants picked on those seeds, so it is checked on 40 new seeds. There it gives +0.6e-4 ± 0.7e-4 (50-stock subset +1.3e-4 ± 0.7e-4). The true gain is therefore small, about +0.6e-4 to +1.0e-4, and not established.
+- The d 32 soft-Score set model without the panel columns stays the candidate; susp + sbl + shares (18 columns) is at most a small, unproven improvement. The market-level and shareholding groups are harmful.

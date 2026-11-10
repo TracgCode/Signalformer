@@ -46,7 +46,12 @@ model with 20 seeds each, their ensemble (each divided by its sd per fold), and 
 demo/runs/e4j_final_pred.npz.
 Part 'final2' (python demo/stock_score_itoken.py final2): since 20 seeds beat 5, the d 32 soft-Score model with 40
 seeds, and d 16 / d 128 soft Score with 20 seeds each; forecasts to demo/runs/e4j_final2_pred.npz.
-Usage: python demo/stock_score_itoken.py [width | ident | aux | hp | hp2 | rank | top50 | final | final2]
+Part 'premask' (python demo/stock_score_itoken.py premask): the d 32 soft-Score model with 40 seeds whose attention
+context and gap-block day mean use only stocks known before 09:00 (features of t - 1 finite, past the first FIRST days),
+instead of the rows usable on day t (which also require that the stock trades on t and that r and the gap of t exist).
+The loss and the evaluation keep the usable rows; ĝ_pre is predicted on the pre-open rows. Paired with the final2
+model (same seeds 0..39); forecasts to demo/runs/e4j_premask_pred.npz.
+Usage: python demo/stock_score_itoken.py [width | ident | aux | hp | hp2 | rank | top50 | final | final2 | premask]
 """
 
 import json
@@ -115,6 +120,28 @@ FINAL2 = {"d 32, soft Score, 40 seeds": ("day", "e4h", 32, "r", "soft", False, "
 GT = None    # (sel, refit) tensors of the standardized gap residual for part aux
 IND = None   # (S, K) industry one-hot tensor, set in main for part ident
 IND_P = None
+ATT = None   # (T, S) attention mask when it differs from the loss mask (part premask)
+PREMASK = {"d 32, soft Score, 40 seeds, pre-open mask": FINAL2["d 32, soft Score, 40 seeds"]}
+
+
+def ghat_rows(Z, g, ok, rows_out, year, Yb):
+    """ghat_for, but the forecasts are made on rows_out (a superset of ok) instead of ok only."""
+    from stock_itrans_news import ghat_for as _gf
+    G = _gf(Z, g, ok, year, Yb)
+    extra = rows_out & ~ok & np.isfinite(Z).all(-1)
+    inner, sel, rows = ok & (year < Yb - 1), ok & (year == Yb - 1), ok & (year < Yb)
+    m = Ridge(Z[inner], g[inner])
+    a = min(ALPHAS, key=lambda a: np.mean((m.predict(Z[sel], m.weights(a)) - g[sel]) ** 2))
+    at = extra & (year == Yb)
+    if at.any():
+        m = Ridge(Z[rows], g[rows])
+        G[at] = m.predict(Z[at], m.weights(a))
+    for yy in np.unique(year[rows]):
+        at = extra & (year == yy)
+        if at.any():
+            mf = Ridge(Z[rows & (year != yy)], g[rows & (year != yy)])
+            G[at] = mf.predict(Z[at], mf.weights(a))
+    return G
 
 
 class TokNet(nn.Module):
@@ -221,7 +248,7 @@ def train(cfg, inp, Y, OFF, M, days, seed, epochs=None, vdays=None, G=None):
 
     def run(b):
         m = M[b]
-        return net(*inp.batch(b), OFF[b], m)[m], Y[b][m]
+        return net(*inp.batch(b), OFF[b], m if ATT is None else ATT[b])[m], Y[b][m]
 
     for ep in range(1, (epochs or 40) + 1):
         net.train()
@@ -254,8 +281,8 @@ def train(cfg, inp, Y, OFF, M, days, seed, epochs=None, vdays=None, G=None):
 
 
 def main() -> None:
-    global IND, IND_P, LADDER
-    part = next((p_ for p_ in ("width", "ident", "aux", "hp2", "hp", "rank", "top50", "final2", "final")
+    global IND, IND_P, LADDER, ATT
+    part = next((p_ for p_ in ("width", "ident", "aux", "hp2", "hp", "rank", "top50", "final2", "final", "premask")
                  if p_ in sys.argv[1:]),
                 "ladder")
     dates, r, traded, gap, known = load()
@@ -306,6 +333,13 @@ def main() -> None:
         LADDER = FINAL
     if part == "final2":
         LADDER = FINAL2
+    if part == "premask":
+        LADDER = PREMASK
+    pm = (np.arange(T) >= FIRST)[:, None] & np.isfinite(X).all(-1)
+    print(f"pre-open rows {pm.sum()}, usable rows {ok.sum()}, pre-open but not usable {(pm & ~ok).sum()}, "
+          f"usable but not pre-open {(ok & ~pm).sum()}", flush=True)
+    if part == "premask":
+        ATT = torch.tensor(pm | ok, device=DEV)
     names = ["ref: MSE ridge"] + list(LADDER) + (["chosen on Y - 1 by the validation loss"] if part in ("hp", "hp2") else [])
     if part == "final":
         names.append("ensemble of the two")
@@ -313,9 +347,14 @@ def main() -> None:
     Yt = torch.tensor(np.where(ok, y, 0.0), dtype=torch.float32, device=DEV)
     Mt = torch.tensor(ok, device=DEV)
     for Y in EVAL:
-        gh_s, gh_r = ghat_for(XG, g, ok, year, Y - 1), ghat_for(XG, g, ok, year, Y)
-        Zs = np.concatenate([X, gap_block(gh_s, ok)], -1)
-        Zr = np.concatenate([X, gap_block(gh_r, ok)], -1)
+        if part == "premask":
+            gh_s, gh_r = ghat_rows(XG, g, ok, pm, year, Y - 1), ghat_rows(XG, g, ok, pm, year, Y)
+            Zs = np.concatenate([X, gap_block(gh_s, pm & np.isfinite(gh_s))], -1)
+            Zr = np.concatenate([X, gap_block(gh_r, pm & np.isfinite(gh_r))], -1)
+        else:
+            gh_s, gh_r = ghat_for(XG, g, ok, year, Y - 1), ghat_for(XG, g, ok, year, Y)
+            Zs = np.concatenate([X, gap_block(gh_s, ok)], -1)
+            Zr = np.concatenate([X, gap_block(gh_r, ok)], -1)
         inner, sel, rows, te = ok & (year < Y - 1), ok & (year == Y - 1), ok & (year < Y), ok & (year == Y)
         gres = lambda gh, fm_: np.where(ok & np.isfinite(gh), (g - gh) / np.nanstd((g - gh)[fm_]), 0.0)
         G_s = torch.tensor(np.nan_to_num(gres(gh_s, inner)), dtype=torch.float32, device=DEV)
@@ -350,7 +389,7 @@ def main() -> None:
                 with torch.no_grad():
                     for i in range(0, len(d_te), 64):
                         b = d_te[i:i + 64]
-                        o[b.cpu().numpy()] += net(*inp_r.batch(b), o_r[b], Mu[b]).cpu().numpy()
+                        o[b.cpu().numpy()] += net(*inp_r.batch(b), o_r[b], Mu[b] if ATT is None else ATT[b]).cpu().numpy()
                 eps.append(ep)
             res[name][te] = o[te]
             msg.append(f"{name}: epochs {eps}, val {np.mean(vbest[name]):.5f}")
@@ -378,7 +417,14 @@ def main() -> None:
         report({k: res[k] for k in names[1:]}, refs, y, subsets[:2], fm)
     for k in names:
         print(f"share of up calls, {k}: {np.mean(res[k][ev] > 0):.3f}")
-    if part in ("final", "final2"):
+    if part == "premask" and (Path(__file__).resolve().parent / "runs" / "e4j_final2_pred.npz").exists():
+        z2 = np.load(Path(__file__).resolve().parent / "runs" / "e4j_final2_pred.npz")
+        k2 = "E4j final2: d 32, soft Score, 40 seeds, usable-row mask"
+        res[k2] = z2["d_32_soft_Score_40_seeds"]
+        names.append(k2)
+        print("\n######## pre-open mask vs the usable-row mask of final2 (same seeds, paired)")
+        report({k: res[k] for k in names}, {names[1]: k2, k2: names[0]}, y, subsets[:2], fm)
+    if part in ("final", "final2", "premask"):
         print("\n######## by year (100 stocks): Score of the ridge and each model, and model - ridge")
         dayi = np.repeat(np.arange(T)[:, None], S, 1)
         from stock_walkforward import clustered_mean

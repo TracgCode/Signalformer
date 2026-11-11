@@ -51,7 +51,14 @@ def windowed(series: np.ndarray, h: np.ndarray) -> np.ndarray:
     return out
 
 
-def load():
+US_FRESH = ("^IXIC", "^GSPC")
+
+
+def load(fresh_us=False):
+    """fresh_us: take the US columns US_FRESH from the row dated t instead of the row before t. global_data.csv holds in
+    its row dated D the US close of the date of the previous row (a US day before D), so the row dated t is known
+    before the Taiwan open of t. ^TWII, ^KS11 and TX_OI stay as of the day before t (their row t is same-day). ^VIX is
+    left out: its close (16:15 New York) is 05:15 Taipei in winter. The default (False) is unchanged."""
     stocks = json.loads((ROOT / "info.json").read_text())["Top100@Y"]
     opens, closes = {}, {}
     for s in stocks:
@@ -65,6 +72,10 @@ def load():
     # the US close of the day before the forecast day is known at the Taiwan open (as of date - 1 day)
     known = g.reindex(o.index - pd.Timedelta(days=1), method="ffill")
     known.index = o.index
+    if fresh_us:
+        now = g.reindex(o.index, method="ffill")
+        for col in US_FRESH:
+            known[col] = now[col].to_numpy()
     return o.index, r, traded, gap, known
 
 

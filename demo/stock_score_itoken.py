@@ -290,8 +290,12 @@ def main() -> None:
     info = json.loads((ROOT / "info.json").read_text())
     stocks, top50 = info["Top100@Y"], set(info["Top50@Y"])
     X, y = base_features(dates, r, traded, gap, known, stocks)
-    STR = struct_features(dates, stocks)
-    has = (STR[..., 0] + STR[..., 1]) > 0
+    try:  # the news struct items only define one reporting subset; the models do not use them
+        STR = struct_features(dates, stocks)
+        has = (STR[..., 0] + STR[..., 1]) > 0
+    except FileNotFoundError:
+        print("no news struct data in dataset/news: the subset of days with an own overnight item is skipped", flush=True)
+        has = None
     year = np.repeat(dates.year.to_numpy()[:, None], S, axis=1)
     half = year * 2 + (np.repeat(dates.month.to_numpy()[:, None], S, axis=1) > 6)
     yrs = dates.year.to_numpy()
@@ -311,9 +315,9 @@ def main() -> None:
     XG = np.concatenate([X, PO], -1)
     ev = ok & np.isin(year, EVAL)
     is50 = np.array([s in top50 for s in stocks])[None, :]
-    subsets = (("all 100 stocks", ev), ("the 50-stock subset", ev & is50),
-               ("100 stocks, days with an own overnight item", ev & has),
-               ("100 stocks, 2025-2026", ev & (year >= 2025)))
+    subsets = (("all 100 stocks", ev), ("the 50-stock subset", ev & is50)) + (
+        (("100 stocks, days with an own overnight item", ev & has),) if has is not None else ()) + (
+        ("100 stocks, 2025-2026", ev & (year >= 2025)),)
     fm = lambda t: f"{UNIT * t[0]:+5.1f}e-4 ± {UNIT * t[1]:3.1f}e-4"
     if part == "width":
         LADDER = WIDTH

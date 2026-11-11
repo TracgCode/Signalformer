@@ -2,6 +2,8 @@
 
 - yahoo: daily bars (unofficial chart API, as in demo/fetch_intl.py) of the peers below and four market series,
   2019-12 .. 2026-08 -> dataset/peers/{us,jp,kr,mkt}/SYMBOL.csv (Korean codes are tried on KOSPI, then KOSDAQ);
+- eu: daily bars (same API) of the European peers below and three European indices -> dataset/peers/eu/SYMBOL.csv;
+  the European session of t - 1 closes at 00:30 Taipei (23:30 in the summer), before the US close;
 - edgar: the SEC EDGAR filing index of every US peer (form, 8-K items, acceptance time to the second; keyless, a
   User-Agent with a contact address read from keys/sec_ua.txt outside the repo, well under 10 requests a second) -> dataset/peers/edgar/TICKER.csv. Item 2.02 of an 8-K is
   the earnings release; foreign filers (ASML, ARM, ZIM, CLS) file 6-K without items;
@@ -11,11 +13,13 @@
   file per month -> dataset/news/alpaca/YYYYMM.jsonl.gz (resumable per month);
 - alpaca_bars: hourly bars with the extended hours (SIP feed, raw prices; same key) of the US peers and SPY / QQQ /
   SOXX, 2019-11-25 .. 2026-08-31, 1 request a second -> dataset/peers/alpaca_bars/SYM.csv (t = bar start UTC);
+- alpaca_bars_x: the same hourly bars of the country ETFs and Asian ADRs of EXTRA_BARS;
+- crypto_bars: hourly BTC/USD and ETH/USD (around the clock, Alpaca crypto data, no key);
 - edgar_docs: the text of the press release (exhibit 99.x, else the largest other document) of every 8-K with item
   2.02 and every 6-K since 2019-11 (SEC EDGAR, same User-Agent, 1 request a second) -> dataset/peers/edgar_docs/
   TICKER.jsonl.gz (resumable per ticker).
 
-    python demo/fetch_peers.py yahoo|edgar|gdelt|alpaca|alpaca_bars|edgar_docs
+    python demo/fetch_peers.py yahoo|eu|edgar|gdelt|alpaca|alpaca_bars|alpaca_bars_x|crypto_bars|edgar_docs
 """
 
 import io
@@ -74,6 +78,20 @@ PEERS = {
     "2912": ([], ["3382"], []),
     "3293": (["RBLX", "TTWO", "EA"], ["7974", "9697"], ["259960", "036570"]),
 }
+# European peers of the Taiwan stocks (Yahoo symbols) and European indices (STOXX 600, DAX, Euro Stoxx 50)
+EU_PEERS = {
+    **{s: ["ASML.AS", "ASM.AS", "BESI.AS"] for s in ("2330", "2303", "3711")},
+    **{s: ["IFX.DE", "STMPA.PA"] for s in ("2454", "3034", "2379", "2327")},
+    **{s: ["SAP.DE", "NOKIA.HE", "ERIC-B.ST"] for s in ("2345", "2383")},
+    **{s: ["SU.PA", "SIE.DE"] for s in ("2308", "2395")},
+    **{s: ["HSBA.L", "BNP.PA", "ALV.DE"] for s in ("2881", "2882", "2891", "2886", "2884", "2885", "2892", "2880",
+                                                  "5880", "2890", "2883", "2887", "5871")},
+    **{s: ["BAS.DE"] for s in ("1301", "1303", "6505")},
+    "2002": ["MT.AS"],
+    **{s: ["MAERSK-B.CO", "HLAG.DE"] for s in ("2603", "2609", "2615")},
+    **{s: ["DTE.DE", "ORA.PA"] for s in ("2412", "3045", "4904")},
+}
+EU_INDEX = ["^STOXX", "^GDAXI", "^STOXX50E"]
 MARKET = {"^BKX", "^TNX", "CL=F", "FXI"}
 US = sorted({t for u, _, _ in PEERS.values() for t in u} - MARKET)
 JP = sorted({t for _, j, _ in PEERS.values() for t in j})
@@ -116,6 +134,19 @@ def run_yahoo():
                 except Exception as e:  # noqa: BLE001
                     print(f"{mkt} {c}{suf}: failed ({e})", flush=True)
             time.sleep(1)
+
+
+def run_eu():
+    (OUT / "eu").mkdir(parents=True, exist_ok=True)
+    for c in sorted({t for v in EU_PEERS.values() for t in v}) + EU_INDEX:
+        path = OUT / "eu" / f"{c.replace('^', '')}.csv"
+        if path.exists():
+            continue
+        try:
+            print(f"eu {c}: {yahoo(c, path)} rows", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"eu {c}: failed ({e})", flush=True)
+        time.sleep(1)
 
 
 def run_edgar():
@@ -230,13 +261,18 @@ def paced(url, headers, stop=(401, 403, 422)):
     raise SystemExit(f"giving up on {url}")
 
 
-def run_alpaca_bars():
+# country ETFs and Asian ADRs traded in the US session and its extended hours (alpaca_bars_x)
+EXTRA_BARS = ["EWT", "EWJ", "EWY", "FXI", "KWEB", "SONY", "TM", "MUFG", "SMFG", "KB", "SHG", "PKX", "SMH", "TLT", "UUP"]
+
+
+def run_alpaca_bars(extra=False):
     import os
     kid, sec = (KEYS / "alpaca").read_text().split()[:2]
     h = {"APCA-API-KEY-ID": kid, "APCA-API-SECRET-KEY": sec}
     out = OUT / "alpaca_bars"
     out.mkdir(exist_ok=True)
-    for s_ in sorted(p.stem for p in (OUT / "us").glob("*.csv")) + ["SPY", "QQQ", "SOXX"]:
+    syms = EXTRA_BARS if extra else sorted(p.stem for p in (OUT / "us").glob("*.csv")) + ["SPY", "QQQ", "SOXX"]
+    for s_ in syms:
         dst = out / f"{s_}.csv"
         if dst.exists():
             continue
@@ -249,6 +285,33 @@ def run_alpaca_bars():
             d = json.loads(paced(f"https://data.alpaca.markets/v2/stocks/{s_}/bars?" + urllib.parse.urlencode(q), h,
                                  stop=(401, 403, 422)))
             rows += d.get("bars") or []
+            tok = d.get("next_page_token")
+            if not tok:
+                break
+        f = pd.DataFrame(rows)
+        f.to_csv(dst.with_suffix(".tmp"), index=False)
+        os.replace(dst.with_suffix(".tmp"), dst)
+        print(f"{s_}: {len(f)} bars", flush=True)
+
+
+def run_crypto_bars():
+    """hourly BTC/USD and ETH/USD bars (Alpaca crypto market data, no key needed), 2019-11-25 .. 2026-08-31, around the
+    clock -> dataset/peers/alpaca_bars/BTC_USD.csv, ETH_USD.csv (t = bar start UTC)."""
+    import os
+    out = OUT / "alpaca_bars"
+    out.mkdir(exist_ok=True)
+    for s_ in ("BTC/USD", "ETH/USD"):
+        dst = out / f"{s_.replace('/', '_')}.csv"
+        if dst.exists():
+            continue
+        rows, tok = [], None
+        while True:
+            q = dict(symbols=s_, timeframe="1Hour", start="2019-11-25T00:00:00Z", end="2026-09-01T00:00:00Z", limit=10000)
+            if tok:
+                q["page_token"] = tok
+            d = json.loads(paced("https://data.alpaca.markets/v1beta3/crypto/us/bars?" + urllib.parse.urlencode(q), {},
+                                 stop=(401, 403, 422)))
+            rows += (d.get("bars") or {}).get(s_) or []
             tok = d.get("next_page_token")
             if not tok:
                 break
@@ -300,5 +363,6 @@ def run_edgar_docs():
 
 
 if __name__ == "__main__":
-    {"yahoo": run_yahoo, "edgar": run_edgar, "gdelt": run_gdelt, "alpaca": run_alpaca, "alpaca_bars": run_alpaca_bars,
+    {"yahoo": run_yahoo, "eu": run_eu, "edgar": run_edgar, "gdelt": run_gdelt, "alpaca": run_alpaca, "alpaca_bars": run_alpaca_bars,
+     "alpaca_bars_x": lambda: run_alpaca_bars(extra=True), "crypto_bars": run_crypto_bars,
      "edgar_docs": run_edgar_docs}[sys.argv[1]]()

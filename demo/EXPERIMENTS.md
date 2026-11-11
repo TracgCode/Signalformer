@@ -3332,3 +3332,592 @@ Each variant is paired with the base trained the same way (batched trainer, same
 - **Every single group falls to noise with 40 seeds** (−0.3e-4 to +0.2e-4); the 10-seed gains (+1.0e-4 to +1.5e-4) were seed noise, as in E4m.
 - **The union susp + sbl + shares** reaches +1.5e-4 ± 0.5e-4 on seeds 0..39. This is the best of 8 variants picked on those seeds, so it is checked on 40 new seeds. There it gives +0.6e-4 ± 0.7e-4 (50-stock subset +1.3e-4 ± 0.7e-4). The true gain is therefore small, about +0.6e-4 to +1.0e-4, and not established.
 - The d 32 soft-Score set model without the panel columns stays the candidate; susp + sbl + shares (18 columns) is at most a small, unproven improvement. The market-level and shareholding groups are harmful.
+
+### E4o: the overnight US news of the peers in the best model (`demo/stock_score_usnews.py`)
+
+**News used:** the Benzinga news of the 46 US peers (Alpaca), published after the last US regular close and before 08:50 Taipei: 24,719 scored articles. Each is scored by Qwen3.5 as P(about the company) × (P(positive) − P(negative)) and summed per peer and day. 13.9% of the stock-days have news of a peer.
+
+**Inputs added to the 55:**
+- **peer (2):** for each stock, the mean over its hand-made peers of the score sum and of log(1 + count);
+- **market (2):** the sum over the 46 peers and log(1 + total count);
+- **control:** the peer inputs of another day of the same year.
+
+**Training:** the batched trainer, 40 seeds 0..39, each variant paired with the base.
+
+| Model | Sign score (100) | − ridge | − set base | Sign score (50) | − set base (50) | − set base (stock-days with peer news) | Up share |
+|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | | 0.000 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | | 0.376 |
+| set base | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | +14.5e-4 | 0 | 0 | 0.453 |
+| + peer news | +17.8e-4 ± 2.1e-4 | +3.1e-4 ± 1.1e-4 | −0.2e-4 ± 0.4e-4 | +14.3e-4 | −0.3e-4 ± 0.4e-4 | −0.0e-4 ± 0.8e-4 | 0.451 |
+| + peer and market news | +17.9e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | −0.0e-4 ± 0.5e-4 | +14.3e-4 | −0.3e-4 ± 0.5e-4 | −1.0e-4 ± 1.1e-4 | 0.447 |
+| + peer news of another day (control) | +17.7e-4 ± 2.1e-4 | +3.0e-4 ± 1.0e-4 | −0.3e-4 ± 0.4e-4 | +14.3e-4 | −0.2e-4 ± 0.4e-4 | +0.3e-4 ± 0.7e-4 | 0.457 |
+
+The US news add nothing to the sign score, not even on the stock-days that have news of a peer (−0.0e-4 ± 0.8e-4), and the real news equal the news of another day. This agrees with E3c r5: the TAIEX futures open at 08:45, already in ĝ_pre, prices the overnight US information. No confirmation run is needed.
+
+#### 80 seeds: the two 40-seed bases of E4p summed (post hoc, `demo/runs/e4p_fast40_pred.npz` + `e4p_confirm_pred.npz`)
+
+| Model | Sign score (100) | − seeds 0..39 | − ridge | Sign score (50) |
+|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | | *−6.8e-4 ± 2.6e-4* | *+3.4e-4* |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | | 0 | +11.0e-4 |
+| set, seeds 0..39 (batched trainer) | +18.0e-4 ± 2.1e-4 | 0 | +3.3e-4 ± 1.1e-4 | +14.5e-4 |
+| set, seeds 40..79 | +18.0e-4 ± 2.1e-4 | +0.0e-4 ± 0.4e-4 | +3.4e-4 ± 1.1e-4 | +14.3e-4 |
+| set, 80 seeds (sum) | +18.1e-4 ± 2.1e-4 | +0.1e-4 ± 0.2e-4 | +3.4e-4 ± 1.1e-4 | +14.4e-4 |
+
+Two disjoint sets of 40 seeds give the same score, and their sum adds nothing: the seed average has converged at 40.
+
+### E4q: the length of the training window (`demo/stock_score_window.py`)
+
+The selection fit uses only the w years before Y − 1 and the refit only the w years before Y, instead of every earlier year. The model is the batched trainer, 40 seeds 0..39, paired with the expanding window. The data start in 2020, so the windows differ from the expanding one only from the 2024 fold on (w = 3: from 2025).
+
+| Model | Sign score (100) | − ridge | − expanding | Sign score (50) | − expanding (50) | − expanding (2025–26) | Up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | | 0.376 | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set, expanding window | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | +14.5e-4 | 0 | 0 | 0.453 | +18.9e-4 | +12.0e-4 | +15.1e-4 | +16.5e-4 | +32.2e-4 |
+| set, last 3 years | +17.2e-4 ± 2.1e-4 | +2.5e-4 ± 1.2e-4 | −0.8e-4 ± 0.8e-4 | +14.1e-4 | −0.4e-4 ± 0.7e-4 | −2.4e-4 ± 2.0e-4 | 0.442 | +18.9e-4 | +12.0e-4 | +15.2e-4 | +18.9e-4 | +22.5e-4 |
+| set, last 2 years | +16.7e-4 ± 2.1e-4 | +2.0e-4 ± 1.2e-4 | −1.3e-4 ± 1.1e-4 | +13.6e-4 | −0.9e-4 ± 1.1e-4 | −3.8e-4 ± 2.8e-4 | 0.442 | +18.9e-4 | +10.4e-4 | +16.8e-4 | +13.9e-4 | +26.6e-4 |
+
+Shorter windows lose, most in 2026 (−9.7e-4 for w = 3); more data beats recency here. The expanding window stays.
+
+### E4r: what each input group contributes, by leaving it out (`demo/stock_score_ablate.py`)
+
+The 55 inputs are 35 degree-0 polynomial readouts, 12 range features, 5 US-session features and the 3-column gap block. Each variant drops one group. The model is the batched trainer, 40 seeds 0..39, paired with the full model. This is an analysis of where the score comes from, not a proposal to remove inputs.
+
+| Model | Sign score (100) | − ridge | − full | Sign score (50) | − full (50) | − full (2025–26) | Up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | | 0.376 | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set, full (55) | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | +14.5e-4 | 0 | 0 | 0.453 | +18.9e-4 | +12.0e-4 | +15.1e-4 | +16.5e-4 | +32.2e-4 |
+| without the polynomial readouts (35) | +15.8e-4 ± 2.1e-4 | +1.1e-4 ± 1.6e-4 | −2.2e-4 ± 1.5e-4 | +12.0e-4 | −2.5e-4 ± 1.5e-4 | −4.6e-4 ± 3.1e-4 | 0.437 | +14.3e-4 | +12.2e-4 | +16.9e-4 | +11.7e-4 | +27.9e-4 |
+| without the range (12) | +17.7e-4 ± 2.1e-4 | +3.0e-4 ± 1.3e-4 | −0.3e-4 ± 0.7e-4 | +14.1e-4 | −0.4e-4 ± 0.7e-4 | −0.8e-4 ± 1.4e-4 | 0.444 | +17.6e-4 | +12.5e-4 | +15.8e-4 | +16.6e-4 | +30.0e-4 |
+| without the US session (5) | +13.6e-4 ± 2.0e-4 | −1.1e-4 ± 1.5e-4 | −4.4e-4 ± 1.5e-4 | +10.8e-4 | −3.7e-4 ± 1.5e-4 | −3.7e-4 ± 2.6e-4 | 0.427 | +9.3e-4 | +8.5e-4 | +13.9e-4 | +15.6e-4 | +24.2e-4 |
+| without the gap block (3) | +16.2e-4 ± 2.0e-4 | +1.6e-4 ± 1.0e-4 | −1.7e-4 ± 0.9e-4 | +13.0e-4 | −1.5e-4 ± 0.8e-4 | −1.7e-4 ± 1.4e-4 | 0.454 | +13.4e-4 | +10.5e-4 | +16.8e-4 | +16.0e-4 | +28.7e-4 |
+
+- **The 5 US-session features matter most** (−4.4e-4 ± 1.5e-4 without them). These are the TSM ADR, SOX and Nasdaq-futures returns, the ADR premium change and the own ADR. Without them the model falls below the ridge.
+- **The price-history readouts are second** (−2.2e-4 ± 1.5e-4), followed by **the gap block of ĝ_pre** (−1.7e-4 ± 0.9e-4).
+- **The range features add little** (−0.3e-4 ± 0.7e-4).
+- The score therefore rests mostly on the overnight foreign information and on the stock's own recent path, as the earlier experiments with external data suggested.
+
+### E4s: the overnight returns of the US peers (`demo/stock_score_usret.py`)
+
+E4r showed that the 5 US-session features carry most of the score. Here every stock with hand-made US peers (stock_us_relation.prepare: 46 stocks, 126 links to 46 US stocks) also gets the mean overnight return of its peers, the input r_jt of E3a. Stocks without a peer get 0. The second variant adds the equal-weighted basket of the 46 (market level). The control takes the peer returns of another day of the same year. The model is the batched trainer, paired with the base at the same seeds, run on seeds 0..39 and repeated on 40..79.
+
+| Model | Seeds | Sign score (100) | − ridge | − set base | Sign score (50) | − set base (50) | − set base (46 stocks with a peer) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set base | 0..39 | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | +14.5e-4 | 0 | 0 | +18.9e-4 | +12.0e-4 | +15.1e-4 | +16.5e-4 | +32.2e-4 |
+| + peer return | 0..39 | +18.7e-4 ± 2.1e-4 | +4.0e-4 ± 1.2e-4 | +0.7e-4 ± 0.5e-4 | +15.6e-4 | +1.1e-4 ± 0.6e-4 | +1.1e-4 ± 0.6e-4 | +16.4e-4 | +12.8e-4 | +17.1e-4 | +18.2e-4 | +34.1e-4 |
+| + peer return and US basket | 0..39 | +18.7e-4 ± 2.1e-4 | +4.0e-4 ± 1.2e-4 | +0.7e-4 ± 0.6e-4 | +15.3e-4 | +0.7e-4 ± 0.7e-4 | +0.6e-4 ± 0.7e-4 | +15.9e-4 | +13.0e-4 | +17.9e-4 | +18.8e-4 | +32.3e-4 |
+| + peer return of another day (control) | 0..39 | +17.9e-4 ± 2.1e-4 | +3.2e-4 ± 1.2e-4 | −0.1e-4 ± 0.5e-4 | +14.6e-4 | +0.1e-4 ± 0.5e-4 | +0.1e-4 ± 0.5e-4 | +16.6e-4 | +11.6e-4 | +15.9e-4 | +18.1e-4 | +32.0e-4 |
+| set base | 40..79 | +18.0e-4 ± 2.1e-4 | +3.4e-4 ± 1.1e-4 | 0 | +14.3e-4 | 0 | 0 | +17.3e-4 | +12.1e-4 | +15.1e-4 | +17.7e-4 | +32.9e-4 |
+| + peer return | 40..79 | +18.7e-4 ± 2.1e-4 | +4.1e-4 ± 1.2e-4 | +0.7e-4 ± 0.5e-4 | +15.7e-4 | +1.4e-4 ± 0.5e-4 | +1.4e-4 ± 0.6e-4 | +18.0e-4 | +13.0e-4 | +16.0e-4 | +18.2e-4 | +33.5e-4 |
+| + peer return and US basket | 40..79 | +18.6e-4 ± 2.1e-4 | +4.0e-4 ± 1.3e-4 | +0.6e-4 ± 0.6e-4 | +15.4e-4 | +1.1e-4 ± 0.6e-4 | +1.2e-4 ± 0.7e-4 | +17.8e-4 | +13.3e-4 | +16.6e-4 | +17.9e-4 | +32.1e-4 |
+| + peer return of another day (control) | 40..79 | +17.9e-4 ± 2.1e-4 | +3.2e-4 ± 1.2e-4 | −0.1e-4 ± 0.4e-4 | +14.6e-4 | +0.2e-4 ± 0.4e-4 | +0.2e-4 ± 0.4e-4 | +16.5e-4 | +11.7e-4 | +15.1e-4 | +18.2e-4 | +32.9e-4 |
+
+Pooled over the 80 seeds (the two runs summed), the peer return gives +0.7e-4 ± 0.4e-4 on 100 stocks and +1.4e-4 ± 0.5e-4 on the 50-stock subset. The model then scores +18.8e-4 ± 2.1e-4, +4.2e-4 ± 1.2e-4 over the ridge.
+
+- **Unlike the earlier candidates, this gain repeats on fresh seeds.** The variant was the first planned one, not picked among many, and gives +0.7e-4 on both seed sets.
+- **The gain sits where it should.** It is on the stocks that have a peer (+1.1e-4 and +1.4e-4) and on the 50-stock subset (+1.1e-4 and +1.4e-4).
+- **The peer return of another day gives nothing.** So the gain comes from the information, not from an extra input.
+- **The market-level basket adds nothing on top**, as with every market-level input so far.
+- The peer return is a modest but replicated improvement. The d 32 soft-Score set model with 56 inputs (55 + the peer return) becomes the new candidate: +18.7e-4 ± 2.1e-4 at 40 seeds, +4.0e-4 to +4.1e-4 over the ridge, +15.6e-4 to +15.7e-4 on the 50-stock subset.
+
+#### E4s beta: the peer return times the stock's sensitivity to it (`stock_score_usret.py beta`)
+
+**Inputs:** the peer return as before, plus two products: the peer return times the stock's rolling 60-day least-squares beta of its opening gap on the peer return, and times the beta of its open-to-close return on it. Both betas use only days before t and are scaled by their sd over the stocks with a peer. The mean betas are +0.0064 for the gap and +0.00040 for r.
+
+**Training:** the batched trainer, 40 seeds 0..39, paired.
+
+| Model | Sign score (100) | − ridge | − set base | − peer return only | Sign score (50) | − set base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | | *+3.4e-4* | | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | | +11.0e-4 | | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set base | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | | +14.5e-4 | 0 | +18.9e-4 | +12.0e-4 | +15.1e-4 | +16.5e-4 | +32.2e-4 |
+| + peer return | +18.7e-4 ± 2.1e-4 | +4.0e-4 ± 1.2e-4 | +0.7e-4 ± 0.5e-4 | 0 | +15.6e-4 | +1.1e-4 ± 0.6e-4 | +16.4e-4 | +12.8e-4 | +17.1e-4 | +18.2e-4 | +34.1e-4 |
+| + peer return and peer return × betas | +18.0e-4 ± 2.0e-4 | +3.4e-4 ± 1.1e-4 | +0.0e-4 ± 0.7e-4 | −0.6e-4 ± 0.4e-4 | +15.3e-4 | +0.8e-4 ± 0.7e-4 | +12.6e-4 | +13.4e-4 | +16.6e-4 | +18.4e-4 | +34.8e-4 |
+
+The sensitivities do not help: −0.6e-4 ± 0.4e-4 against the peer return alone. The loss is in 2022, where the betas come from about one year of data. The plain peer return stays the candidate.
+
+#### E4s ind: the peer return extended to the stocks without peers by industry (`stock_score_usret.py ind`)
+
+Only 46 stocks have hand-made peers. Of the other 54, 37 get the mean peer return of the peer-having stocks of their industry (profiles.csv), and 17 stay at 0. A flag (1 / 0.5 / 0) tells the three cases apart. The model is the batched trainer, 40 seeds 0..39, paired.
+
+| Model | Sign score (100) | − ridge | − set base | − peer return only | Sign score (50) | − set base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | | *+3.4e-4* | | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | | +11.0e-4 | | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set base | +18.0e-4 ± 2.1e-4 | +3.3e-4 ± 1.1e-4 | 0 | | +14.5e-4 | 0 | +18.9e-4 | +12.0e-4 | +15.1e-4 | +16.5e-4 | +32.2e-4 |
+| + peer return | +18.7e-4 ± 2.1e-4 | +4.0e-4 ± 1.2e-4 | +0.7e-4 ± 0.5e-4 | 0 | +15.6e-4 | +1.1e-4 ± 0.6e-4 | +16.4e-4 | +12.8e-4 | +17.1e-4 | +18.2e-4 | +34.1e-4 |
+| + peer return extended by industry | +18.5e-4 ± 2.1e-4 | +3.8e-4 ± 1.1e-4 | +0.5e-4 ± 0.5e-4 | −0.2e-4 ± 0.4e-4 | +15.3e-4 | +0.8e-4 ± 0.5e-4 | +15.0e-4 | +13.2e-4 | +17.2e-4 | +18.0e-4 | +34.3e-4 |
+
+The industry fill adds nothing (−0.2e-4 ± 0.4e-4 against the peer return alone). The information is in the direct US peers; an industry average of other stocks' peers is too indirect. The plain peer return stays the candidate.
+
+#### E4s panel: a third and fourth replication of the peer return, and the peer return with 18 panel columns (`stock_score_usret.py panel [confirm]`)
+
+These runs use new seeds, 80..119 and then 120..159. Each compares three models: the base, + the peer return, and + the peer return with the 18 panel columns of E4p. The panel columns are susp (short-sale suspension, 2), sbl (securities lending, 10) and shares (shares-issued ratios, 6). The model is the batched trainer, paired at each seed set.
+
+| Model | Seeds | Sign score (100) | − ridge | − set base | Sign score (50) | − set base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set base | 80..119 | +17.7e-4 ± 2.1e-4 | +3.0e-4 ± 1.1e-4 | 0 | +14.3e-4 | 0 | +17.0e-4 | +12.0e-4 | +15.4e-4 | +16.3e-4 | +33.0e-4 |
+| + peer return | 80..119 | +18.7e-4 ± 2.1e-4 | +4.1e-4 ± 1.2e-4 | +1.0e-4 ± 0.4e-4 | +15.8e-4 | +1.5e-4 ± 0.5e-4 | +17.0e-4 | +13.4e-4 | +16.3e-4 | +17.1e-4 | +35.5e-4 |
+| + peer return + panel 18 | 80..119 | +19.9e-4 ± 2.0e-4 | +5.2e-4 ± 1.2e-4 | +2.2e-4 ± 0.6e-4 | +17.1e-4 | +2.7e-4 ± 0.7e-4 | +19.6e-4 | +13.6e-4 | +18.1e-4 | +18.6e-4 | +34.2e-4 |
+| set base | 120..159 | +17.8e-4 ± 2.1e-4 | +3.1e-4 ± 1.2e-4 | 0 | +14.1e-4 | 0 | +16.9e-4 | +12.0e-4 | +15.6e-4 | +16.6e-4 | +33.1e-4 |
+| + peer return | 120..159 | +19.0e-4 ± 2.1e-4 | +4.3e-4 ± 1.2e-4 | +1.2e-4 ± 0.5e-4 | +15.7e-4 | +1.6e-4 ± 0.6e-4 | +19.2e-4 | +12.5e-4 | +16.6e-4 | +17.7e-4 | +33.8e-4 |
+| + peer return + panel 18 | 120..159 | +19.4e-4 ± 2.0e-4 | +4.8e-4 ± 1.1e-4 | +1.6e-4 ± 0.5e-4 | +16.5e-4 | +2.5e-4 ± 0.6e-4 | +18.4e-4 | +13.8e-4 | +17.2e-4 | +18.6e-4 | +34.0e-4 |
+
+- **The peer return is replicated four times:** +0.7e-4, +0.7e-4, +1.0e-4 and +1.2e-4 over the base on four disjoint sets of 40 seeds. Pooled over the first 120 seeds it gives +0.8e-4 ± 0.4e-4 on 100 stocks and +1.4e-4 ± 0.5e-4 on the 50-stock subset.
+- **The panel columns on top of the peer return** add +1.1e-4 ± 0.6e-4 and +0.5e-4 ± 0.6e-4 on the two seed sets. Pooled over 80 seeds that is +0.8e-4 ± 0.5e-4, or +0.9e-4 ± 0.6e-4 on the 50-stock subset. Earlier, without the peer return, they gave +1.5e-4 on the seeds they were picked on and +0.6e-4 on new ones. Their effect is likely positive but not established.
+- **Peer return + panel 18 against the base,** pooled over 80 seeds: +1.9e-4 ± 0.5e-4, +2.5e-4 ± 0.6e-4 on the 50-stock subset. The model scores +19.6e-4 ± 2.0e-4.
+- **Candidates:**
+  - **Established:** 55 + the peer return (56 inputs), +18.7e-4 to +19.0e-4 at 40 seeds.
+  - **Likely better, partly unproven:** 56 + the 18 panel columns (74 inputs), +19.4e-4 to +19.9e-4. Its live use needs the daily short-sale suspension, securities-lending and shares-issued data.
+
+#### E4s panelgrp: which panel group carries the gain, and the pooled evidence (`stock_score_usret.py panelgrp`)
+
+New seeds 160..199. The models are the base, the peer return, and the peer return with each panel group alone or with all three. The batched trainer is used, and all models are paired.
+
+| Model | Sign score (100) | − ridge | − set base | − peer return only | Sign score (50) | − peer return only (50) |
+|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | | *+3.4e-4* | |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | | +11.0e-4 | |
+| set base | +18.1e-4 ± 2.1e-4 | +3.4e-4 ± 1.1e-4 | 0 | | +15.0e-4 | |
+| + peer return | +18.5e-4 ± 2.1e-4 | +3.8e-4 ± 1.2e-4 | +0.4e-4 ± 0.5e-4 | 0 | +15.5e-4 | 0 |
+| + peer return + susp (2) | +18.7e-4 ± 2.1e-4 | +4.1e-4 ± 1.2e-4 | +0.7e-4 ± 0.5e-4 | +0.2e-4 ± 0.5e-4 | +15.7e-4 | +0.2e-4 ± 0.5e-4 |
+| + peer return + sbl (10) | +18.8e-4 ± 2.0e-4 | +4.1e-4 ± 1.1e-4 | +0.7e-4 ± 0.5e-4 | +0.2e-4 ± 0.4e-4 | +15.8e-4 | +0.2e-4 ± 0.5e-4 |
+| + peer return + shares (6) | +19.1e-4 ± 2.0e-4 | +4.4e-4 ± 1.2e-4 | +1.0e-4 ± 0.6e-4 | +0.6e-4 ± 0.5e-4 | +15.8e-4 | +0.3e-4 ± 0.5e-4 |
+| + peer return + all three (18) | +19.5e-4 ± 2.0e-4 | +4.8e-4 ± 1.1e-4 | +1.4e-4 ± 0.6e-4 | +1.0e-4 ± 0.5e-4 | +16.5e-4 | +1.0e-4 ± 0.6e-4 |
+
+Pooled over all runs (the forecasts of the seed sets summed):
+
+| Model | Seeds | Sign score (100) | − set base | − ridge | Sign score (50) | − set base (50) | − ridge (50) |
+|---|---|---|---|---|---|---|---|
+| set base | 0..199 | +18.1e-4 ± 2.1e-4 | 0 | | +14.6e-4 | 0 | |
+| + peer return | 0..199 | +18.7e-4 ± 2.1e-4 | +0.6e-4 ± 0.3e-4 | +4.1e-4 ± 1.2e-4 | +15.8e-4 | +1.2e-4 ± 0.5e-4 | +4.8e-4 ± 1.3e-4 |
+| + peer return + panel 18 | 80..199 | +19.6e-4 ± 2.0e-4 | +1.7e-4 ± 0.5e-4 (vs base 80..199) | +5.0e-4 ± 1.1e-4 | +16.7e-4 | +2.2e-4 ± 0.7e-4 | +5.7e-4 ± 1.2e-4 |
+
+- **The peer return gains in all five runs:** +0.7e-4, +0.7e-4, +1.0e-4, +1.2e-4 and +0.4e-4. Pooled over 200 seeds the gain is +0.6e-4 ± 0.3e-4 on 100 stocks and +1.2e-4 ± 0.5e-4 on the 50-stock subset.
+- **The panel columns on top of it gain in all three runs:** +1.1e-4, +0.5e-4 and +1.0e-4, or +1.0e-4 ± 0.5e-4 pooled over 120 seeds. No single group carries the gain (+0.2e-4 to +0.6e-4 each); the three together do.
+- The 74-input model (55 + peer return + 18 panel columns) is now the best: +19.5e-4 to +19.9e-4 at 40 seeds, +1.7e-4 ± 0.5e-4 over the 55-input model, +5.0e-4 ± 1.1e-4 over the ridge, and +16.7e-4 on the 50-stock subset. Its panel part (about 2 SE) is less certain than its peer-return part.
+
+#### E4s panel premask: the 74-input model under the pre-open mask (`stock_score_usret.py panel premask`)
+
+The attention context and the gap-block day mean use only the stocks known before 09:00, as in E4j premask. The model is the batched trainer, 40 seeds 0..39, paired with the 55-input model under the same mask.
+
+| Model | Sign score (100) | − ridge | − 55-input model | Sign score (50) | − 55-input model (50) | Up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| *Always down* | *+7.8e-4 ± 2.4e-4* | *−6.8e-4 ± 2.6e-4* | | *+3.4e-4* | | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| MSE ridge | +14.7e-4 ± 2.0e-4 | 0 | | +11.0e-4 | | 0.376 | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| 55-input set model, pre-open mask | +18.2e-4 ± 2.1e-4 | +3.5e-4 ± 1.1e-4 | 0 | +14.6e-4 | 0 | 0.454 | +18.5e-4 | +11.9e-4 | +14.7e-4 | +17.3e-4 | +33.5e-4 |
+| 74-input set model (+ peer return + panel 18), pre-open mask | +19.7e-4 ± 2.0e-4 | +5.1e-4 ± 1.1e-4 | +1.6e-4 ± 0.6e-4 | +16.4e-4 | +1.7e-4 ± 0.7e-4 | 0.465 | +18.5e-4 | +13.5e-4 | +17.3e-4 | +19.1e-4 | +35.8e-4 |
+
+Under the strict pre-open mask the 74-input model keeps its gain: +1.6e-4 ± 0.6e-4 over the 55-input model, and +19.7e-4 in all, +5.1e-4 over the ridge. It is at or above the 55-input model in every year. The gain also holds on a fifth independent set of seeds.
+
+### E4t: GDELT political events between the US, China, Taiwan, Japan and the Koreas (`demo/stock_score_gdelt.py`)
+
+Data: GDELT 2.0 event files (`demo/fetch_politics.py gdelt`, 2019-12-01 .. 2026-08-31, not committed). The events kept
+are those whose two actors are both among USA, CHN, TWN, JPN, KOR and PRK, with different countries on the two sides.
+For day t the window runs from the Taiwan close of t − 1 (05:30 UTC) to 08:45 Taipei of t (00:45 UTC), by the event's
+DATEADDED, which is to the 15 minutes; so every input is known before the open. In 0.8% of the days the window has no
+event.
+
+Features: the events are taken in three groups: all pairs, China–Taiwan and US–China. Each group gives four values:
+- log(1 + the number of events);
+- the mean Goldstein scale, weighted by the mentions;
+- the mean tone, weighted by the mentions;
+- the share of material-conflict events (quad class 4).
+
+Each of the 12 values is taken minus its mean over the previous 60 trading days, divided by its standard deviation
+before 2021 and clipped at ±5. The values are market-wide: every stock gets the same ones on a given day.
+
+Base: the 74-input model (55 + the peer US return + the panel groups susp, sbl and shares, as in E4s panel). Variants:
+- \+ all 12 GDELT values;
+- \+ the 8 values of China–Taiwan and US–China only;
+- control: the 12 values of another day of the same year.
+
+Training follows stock_score_fast.py: 40 seeds (0..39), batched. Every variant is paired with the base trained on the
+same seeds. Walk-forward evaluation, 2022–2026.
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.8e-4 ± 2.6e-4 | — | +3.4e-4 ± 2.3e-4 | — | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +14.7e-4 ± 2.0e-4 | 0 | — | +11.0e-4 ± 1.9e-4 | — | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set, 74-input base | +19.1e-4 ± 2.0e-4 | +4.5e-4 ± 1.1e-4 | — | +16.3e-4 ± 1.9e-4 | — | +17.0e-4 | +13.4e-4 | +17.3e-4 | +18.8e-4 | +34.3e-4 |
+| set + GDELT (12) | +19.5e-4 ± 2.0e-4 | +4.8e-4 ± 1.3e-4 | +0.4e-4 ± 0.9e-4 | +17.1e-4 ± 1.9e-4 | +0.8e-4 ± 0.9e-4 | +23.8e-4 | +11.1e-4 | +17.3e-4 | +16.7e-4 | +33.2e-4 |
+| set + GDELT China–Taiwan, US–China (8) | +18.1e-4 ± 2.0e-4 | +3.4e-4 ± 1.2e-4 | −1.1e-4 ± 0.7e-4 | +16.0e-4 ± 1.9e-4 | −0.3e-4 ± 0.7e-4 | +18.1e-4 | +10.7e-4 | +17.8e-4 | +16.2e-4 | +32.4e-4 |
+| set + GDELT of another day (control) | +18.8e-4 ± 2.0e-4 | +4.2e-4 ± 1.3e-4 | −0.3e-4 ± 1.0e-4 | +16.4e-4 ± 1.9e-4 | +0.1e-4 ± 0.9e-4 | +19.2e-4 | +12.2e-4 | +18.5e-4 | +17.7e-4 | +30.3e-4 |
+
+Reading the table: the ± values are day-clustered standard errors, and the "−" columns are paired differences.
+
+Observations:
+- The 12 GDELT values change the sign score by +0.4e-4 ± 0.9e-4. That gain is within one standard error of 0, and the
+  control with the days shuffled changes it by −0.3e-4 ± 1.0e-4.
+- The whole gain comes from 2022 (+6.8e-4 over the base). In 2023, 2025 and 2026 the variant is below the base, and in
+  2025–2026 the difference is −1.8e-4 ± 1.2e-4.
+- The China–Taiwan and US–China subset is below the base: −1.1e-4 ± 0.7e-4.
+- Conclusion: country-pair aggregates of GDELT events do not add to the 74-input model. They are not kept.
+- With seeds 0..39 the 74-input model scores +19.1e-4. With seeds 80..119 (E4s panel) it scored +19.6e-4, so the
+  seed-to-seed spread of the whole model is about 0.5e-4.
+
+### E4u: foreign information known before the open, per stock through hand-made peers (`demo/stock_score_preopen.py`)
+
+Each series is divided by its standard deviation before 2022 and then averaged over the stock's hand-made peers. A
+stock without such a peer gets 0. Inputs for day t:
+- **Japan and Korea:** the open gap log(open_t / close_{t−1}) of the stock's Japanese and Korean peers, 2 columns. It
+  is known at 08:00 Taipei. 36 stocks have such peers; 28 Japanese and 20 Korean series.
+- **US after-hours (Alpaca hourly bars):** log(last after-hours price / regular close) of the stock's US peers, from
+  the latest US session before t. The last bar must start at 16:00 ET or later and end by 08:45 Taipei. QQQ and SOXX
+  give two market-wide columns, the same for every stock. 3 columns; 46 stocks. Check: NVDA after its earnings on
+  2024-05-22 gives +5.96%.
+- **Europe:** the return of the European session before t, which closes at 00:30 Taipei (23:30 in the summer). Peers
+  per stock: European semiconductors, telecoms, power and automation, banks and insurers, chemicals, steel, shipping.
+  STOXX 600 gives one market-wide column. 2 columns; 34 stocks. Yahoo daily bars, `demo/fetch_peers.py eu`.
+
+Base: the 74-input model. 40 seeds (0..39); every variant is paired with the base trained on the same seeds.
+
+Before training, two checks on the stock-days where a column is nonzero:
+- correlation with r: Japan +0.020, Korea −0.002, US after-hours peers +0.014, Europe peers +0.036;
+- correlation with the open gap: Japan +0.40, Korea +0.43, Europe peers +0.28.
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.8e-4 ± 2.6e-4 | — | +3.4e-4 ± 2.3e-4 | — | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +14.7e-4 ± 2.0e-4 | 0 | — | +11.0e-4 ± 1.9e-4 | — | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set, 74-input base | +19.1e-4 ± 2.0e-4 | +4.5e-4 ± 1.1e-4 | — | +16.3e-4 ± 1.9e-4 | — | +17.0e-4 | +13.4e-4 | +17.3e-4 | +18.8e-4 | +34.3e-4 |
+| + JP/KR peer open gaps (2) | +19.3e-4 ± 2.0e-4 | +4.6e-4 ± 1.1e-4 | +0.2e-4 ± 0.5e-4 | +16.5e-4 ± 1.9e-4 | +0.1e-4 ± 0.5e-4 | +18.4e-4 | +13.4e-4 | +18.3e-4 | +17.6e-4 | +33.6e-4 |
+| + US after-hours (3) | +19.6e-4 ± 2.0e-4 | +4.9e-4 ± 1.3e-4 | +0.5e-4 ± 0.9e-4 | +16.7e-4 ± 1.9e-4 | +0.3e-4 ± 0.9e-4 | +19.8e-4 | +15.4e-4 | +17.3e-4 | +19.2e-4 | +29.8e-4 |
+| + Europe (2) | +20.2e-4 ± 2.0e-4 | +5.5e-4 ± 1.1e-4 | +1.0e-4 ± 0.5e-4 | +17.3e-4 ± 1.8e-4 | +1.0e-4 ± 0.5e-4 | +18.8e-4 | +14.1e-4 | +18.8e-4 | +17.9e-4 | +37.0e-4 |
+| + all three (7) | +20.1e-4 ± 2.0e-4 | +5.5e-4 ± 1.4e-4 | +1.0e-4 ± 1.0e-4 | +17.0e-4 ± 1.9e-4 | +0.6e-4 ± 1.0e-4 | +19.1e-4 | +15.5e-4 | +19.4e-4 | +18.8e-4 | +31.9e-4 |
+| + all three of another day (control) | +19.2e-4 ± 2.0e-4 | +4.5e-4 ± 1.2e-4 | +0.1e-4 ± 0.7e-4 | +16.0e-4 ± 1.9e-4 | −0.3e-4 ± 0.7e-4 | +18.2e-4 | +14.8e-4 | +16.6e-4 | +17.2e-4 | +34.5e-4 |
+
+Reading the table: the ± values are day-clustered standard errors, and the "−" columns are paired differences.
+
+Observations:
+- **Europe gives +1.0e-4 ± 0.5e-4.** The gain is the same on the 50-stock subset, and the variant is at or above the
+  base in 4 of the 5 years. The Europe peer column also has the highest correlation with r of the candidates.
+- **Japan/Korea gaps and US after-hours do not add.** Both are within one standard error of 0. The Japan/Korea gaps
+  correlate with the Taiwan open gap at about 0.4, but not with r. That fits a market that already prices this
+  information at the open.
+- **US after-hours** helps in 2022–2023 and hurts in 2026.
+Replication on seeds 40..79 (`stock_score_preopen.py confirm`), paired with the 74-input base on the same seeds
+(+19.3e-4):
+
+| variant | − 74-input base, seeds 40..79 | − 74-input base, 80 seeds pooled |
+|---|---|---|
+| + JP/KR peer open gaps | +0.0e-4 ± 0.4e-4 | −0.2e-4 ± 0.4e-4 |
+| + US after-hours | +1.4e-4 ± 1.0e-4 | +0.9e-4 ± 0.9e-4 |
+| + Europe | +0.3e-4 ± 0.4e-4 | +0.7e-4 ± 0.4e-4 |
+| + all three | +1.5e-4 ± 1.0e-4 | +1.1e-4 ± 0.9e-4 |
+| + all three of another day (control) | +0.6e-4 ± 0.7e-4 | +0.4e-4 ± 0.7e-4 |
+
+"80 seeds pooled" sums the outputs of the two seed sets per variant. On those pooled forecasts the 74-input base
+scores +19.3e-4.
+
+Observations on the replication:
+- **Europe** does not replicate its first gain (+0.3e-4 against +1.0e-4). Pooled it is +0.7e-4 ± 0.4e-4, about 1.7
+  standard errors.
+- **US after-hours** is larger on these seeds (+1.4e-4) but noisy: pooled +0.9e-4 ± 0.9e-4.
+- **The control** with the days shuffled gives +0.4e-4 pooled. A gain of that size can therefore come from adding any
+  2–7 columns.
+- **Conclusion:** none of the three is a clear gain.
+
+### E4v: market-wide pre-open signals from US ETFs after hours and from crypto (`demo/stock_score_preopen.py x`)
+
+Inputs for day t, the same for every stock that day. Each series is divided by its standard deviation before 2022 and
+clipped at ±8.
+- **ETF after-hours (7 columns):** the after-hours return of EWT, EWJ, EWY, SMH, KWEB, TLT and UUP, the same
+  definition as in E4u. It runs from the regular close to the last hourly bar that ends by 08:45 Taipei. Data: Alpaca
+  hourly bars with the extended hours (`demo/fetch_peers.py alpaca_bars_x`).
+- **Crypto (2 columns):** the BTC/USD and ETH/USD log returns from the Taiwan close of t − 1 (05:30 UTC) to 08:45
+  Taipei of t (00:45 UTC), from hourly bars that end by then. Data: `demo/fetch_peers.py crypto_bars`. Alpaca's crypto
+  bars start in 2021-01, so 85% of the days have a value and the earlier days are 0.
+
+Base: the 74-input model. 40 seeds (0..39); every variant is paired with the base trained on the same seeds.
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.8e-4 ± 2.6e-4 | — | +3.4e-4 ± 2.3e-4 | — | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +14.7e-4 ± 2.0e-4 | 0 | — | +11.0e-4 ± 1.9e-4 | — | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set, 74-input base | +19.1e-4 ± 2.0e-4 | +4.5e-4 ± 1.1e-4 | — | +16.3e-4 ± 1.9e-4 | — | +17.0e-4 | +13.4e-4 | +17.3e-4 | +18.8e-4 | +34.3e-4 |
+| + ETF after-hours (7) | +18.7e-4 ± 2.0e-4 | +4.0e-4 ± 1.3e-4 | −0.5e-4 ± 0.9e-4 | +15.5e-4 ± 1.9e-4 | −0.8e-4 ± 0.9e-4 | +15.9e-4 | +13.5e-4 | +18.1e-4 | +17.8e-4 | +33.0e-4 |
+| + crypto (2) | +19.6e-4 ± 2.0e-4 | +4.9e-4 ± 1.2e-4 | +0.4e-4 ± 0.5e-4 | +16.4e-4 ± 1.9e-4 | +0.1e-4 ± 0.6e-4 | +19.7e-4 | +14.2e-4 | +16.9e-4 | +18.1e-4 | +33.8e-4 |
+| + both (9) | +18.2e-4 ± 2.0e-4 | +3.6e-4 ± 1.3e-4 | −0.9e-4 ± 0.9e-4 | +15.2e-4 ± 1.9e-4 | −1.1e-4 ± 0.9e-4 | +15.4e-4 | +12.9e-4 | +17.1e-4 | +18.0e-4 | +32.6e-4 |
+| + both of another day (control) | +17.2e-4 ± 2.1e-4 | +2.5e-4 ± 1.4e-4 | −2.0e-4 ± 1.0e-4 | +14.7e-4 ± 1.9e-4 | −1.6e-4 ± 1.0e-4 | +18.9e-4 | +12.6e-4 | +17.5e-4 | +17.0e-4 | +21.1e-4 |
+
+Reading the table: the ± values are day-clustered standard errors, and the "−" columns are paired differences.
+
+Observations:
+- **ETF after-hours:** none of the variants adds. The ETF after-hours returns lower the score slightly (−0.5e-4 ±
+  0.9e-4).
+- **Crypto:** within one standard error of 0 (+0.4e-4 ± 0.5e-4).
+- **The control** costs −2.0e-4 ± 1.0e-4, almost all of it in 2026. Nine columns of noise therefore hurt the model,
+  which bounds what an uninformative block costs.
+- **Conclusion:** together with E4t (GDELT) and E4u (Japan/Korea gaps, US after-hours, Europe), this closes the
+  pre-open foreign-information line for now. The overnight US peer return of E4s remains its only clear gain.
+
+### E4w: training settings of the 74-input model under the pre-open mask (`demo/stock_score_train74.py`)
+
+The base is the 74-input model of E4s panel premask. Seven settings are changed one at a time; all models use seeds 0..39 and are paired with the base on the same seeds and data.
+- **Recency weighting:** each training day is weighted by 0.5^((last training day − day) / half-life), with half-life 1 or 3 years. The weights are scaled to mean 1. They enter only the numerator of the soft loss, so a batch of old days counts less. The last training day is the end of Y − 2 in the epoch selection and the end of Y − 1 in the refit; the validation loss stays unweighted.
+- **Loss temperature:** tanh(k f) with k = 0.5 or 2 instead of k = 1, in both the training loss and the validation loss.
+- **Dropout:** 0.1 or 0.3 instead of 0.2.
+- **Width:** d = 48 (4 heads of 12, feed-forward 96) instead of 32.
+
+`demo/stock_score_fast.py` gained optional arguments for these settings. With the defaults the results are bit-identical, and the base row reproduces E4s panel premask exactly in every year.
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.8e-4 ± 2.6e-4 | — | +3.4e-4 ± 2.3e-4 | — | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +14.7e-4 ± 2.0e-4 | 0 | — | +11.0e-4 ± 1.9e-4 | — | 0.376 | +13.9e-4 | +7.8e-4 | +14.4e-4 | +16.7e-4 | +23.5e-4 |
+| set, 74-input base | +19.7e-4 ± 2.0e-4 | +5.1e-4 ± 1.1e-4 | — | +16.4e-4 ± 1.9e-4 | — | 0.465 | +18.5e-4 | +13.5e-4 | +17.3e-4 | +19.1e-4 | +35.8e-4 |
+| recency weight, half-life 1 year | +18.2e-4 ± 2.0e-4 | +3.6e-4 ± 1.1e-4 | −1.5e-4 ± 0.9e-4 | +15.7e-4 ± 1.9e-4 | −0.6e-4 ± 0.9e-4 | 0.446 | +20.9e-4 | +12.8e-4 | +17.0e-4 | +16.0e-4 | +27.6e-4 |
+| recency weight, half-life 3 years | +19.3e-4 ± 2.0e-4 | +4.6e-4 ± 1.2e-4 | −0.5e-4 ± 0.4e-4 | +16.4e-4 ± 1.9e-4 | −0.0e-4 ± 0.4e-4 | 0.457 | +19.3e-4 | +13.0e-4 | +17.5e-4 | +18.7e-4 | +32.2e-4 |
+| soft loss tanh(0.5 f) | +19.3e-4 ± 2.0e-4 | +4.6e-4 ± 1.2e-4 | −0.4e-4 ± 0.3e-4 | +16.3e-4 ± 1.9e-4 | −0.1e-4 ± 0.3e-4 | 0.473 | +17.0e-4 | +14.7e-4 | +16.8e-4 | +18.7e-4 | +34.3e-4 |
+| soft loss tanh(2 f) | +19.1e-4 ± 2.0e-4 | +4.5e-4 ± 1.1e-4 | −0.6e-4 ± 0.3e-4 | +16.2e-4 ± 1.9e-4 | −0.2e-4 ± 0.3e-4 | 0.464 | +16.9e-4 | +13.3e-4 | +17.2e-4 | +18.7e-4 | +34.9e-4 |
+| dropout 0.1 | +19.0e-4 ± 2.0e-4 | +4.4e-4 ± 1.1e-4 | −0.7e-4 ± 0.3e-4 | +16.1e-4 ± 1.9e-4 | −0.2e-4 ± 0.3e-4 | 0.470 | +16.5e-4 | +13.4e-4 | +16.6e-4 | +19.5e-4 | +34.4e-4 |
+| dropout 0.3 | +19.4e-4 ± 2.0e-4 | +4.7e-4 ± 1.2e-4 | −0.4e-4 ± 0.2e-4 | +16.4e-4 ± 1.9e-4 | −0.0e-4 ± 0.3e-4 | 0.470 | +17.0e-4 | +14.0e-4 | +17.1e-4 | +18.7e-4 | +35.4e-4 |
+| width d 48 | +19.7e-4 ± 2.0e-4 | +5.0e-4 ± 1.2e-4 | −0.0e-4 ± 0.4e-4 | +16.6e-4 ± 1.9e-4 | +0.2e-4 ± 0.4e-4 | 0.449 | +19.7e-4 | +13.7e-4 | +17.7e-4 | +18.6e-4 | +33.4e-4 |
+
+Reading the table: the ± values are day-clustered standard errors, and the "−" columns are paired differences on the same stock-days. The per-year standard errors are in `demo/runs/stock_score_train74.log`.
+
+Paired difference to the base per year (100 stocks):
+
+| model | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|
+| recency, half-life 1 year | +2.5e-4 ± 1.6e-4 | −0.7e-4 ± 0.8e-4 | −0.3e-4 ± 1.1e-4 | −3.1e-4 ± 2.6e-4 | −8.2e-4 ± 3.9e-4 |
+| recency, half-life 3 years | +0.8e-4 ± 0.9e-4 | −0.5e-4 ± 0.4e-4 | +0.3e-4 ± 0.7e-4 | −0.4e-4 ± 0.7e-4 | −3.7e-4 ± 1.9e-4 |
+| tanh(0.5 f) | −1.4e-4 ± 0.8e-4 | +1.2e-4 ± 0.5e-4 | −0.5e-4 ± 0.3e-4 | −0.4e-4 ± 0.5e-4 | −1.5e-4 ± 0.9e-4 |
+| tanh(2 f) | −1.6e-4 ± 1.0e-4 | −0.2e-4 ± 0.3e-4 | −0.0e-4 ± 0.4e-4 | −0.4e-4 ± 0.4e-4 | −0.9e-4 ± 1.0e-4 |
+| dropout 0.1 | −2.0e-4 ± 0.9e-4 | −0.0e-4 ± 0.3e-4 | −0.7e-4 ± 0.3e-4 | +0.4e-4 ± 0.4e-4 | −1.5e-4 ± 0.8e-4 |
+| dropout 0.3 | −1.5e-4 ± 0.6e-4 | +0.6e-4 ± 0.5e-4 | −0.1e-4 ± 0.5e-4 | −0.4e-4 ± 0.4e-4 | −0.4e-4 ± 0.6e-4 |
+| width d 48 | +1.3e-4 ± 1.6e-4 | +0.2e-4 ± 0.5e-4 | +0.5e-4 ± 0.6e-4 | −0.5e-4 ± 0.6e-4 | −2.4e-4 ± 1.0e-4 |
+
+Observations:
+- **No setting beats the base.** Width 48 ties it (−0.0e-4 ± 0.4e-4). The others are 0.4e-4 to 1.5e-4 below it.
+- **The current settings look like a local optimum.** The near settings (dropout 0.1 and 0.3, temperature 0.5 and 2) flip only 2–4% of the signs, so their paired standard errors are small. Their losses of −0.4e-4 to −0.7e-4 are about 1.5–2.3 standard errors. On the 50-stock subset they are within 0.2e-4 of the base.
+- **Recency weighting hurts, the more so the shorter the half-life.** With a half-life of 1 year the model gains in 2022 (+2.5e-4) but loses in 2025 and 2026 (−8.2e-4 ± 3.9e-4 in 2026). The older years therefore still carry information for the latest folds.
+- **Width 48** is ahead in 2022–2024 and behind in 2026 (−2.4e-4 ± 1.0e-4). Its net effect is zero, so there is no reason to move from d = 32.
+- **Conclusion:** the training settings of the 74-input model stay as they are (dropout 0.2, k = 1, d = 32, no recency weighting). The run took 3.9 min for all 8 models.
+
+### E4x: a date error in the Yahoo futures and FX bars, and the scores on corrected data (`demo/fetch_overnight.py`, `demo/fetch_intl.py`)
+
+**The error.** The fetchers turned the Yahoo timestamps into dates with one fixed UTC offset, the one of the fetch day. Some series stamp their daily bars at 00:00 exchange-local time: NQ=F, ES=F and CL=F (New York) and TWD=X (London). For these, every bar in the daylight-saving season (EDT/BST, about April to October) moved to the previous calendar day. That is 1112 bars of each future and 1025 of TWD=X, visible as Sunday bars.
+
+**Why it matters.** The models take the last bar dated before Taiwan day t. In summer that bar was the US session ending after the Taiwan close of t, a look-ahead leak, while the true overnight bar was missing. In the models this affects `nq_ret` and, through the ADR premium, `adr_prem_chg`.
+
+The other series are stamped at the open (09:30 New York, 09:00 Tokyo/Seoul/Taipei, 08:00–09:00 in Europe) and were unaffected:
+- TSM and the US peers;
+- ^SOX and ^TNX;
+- the European, Japanese and Korean series;
+- the Taiwan stocks.
+
+**The fix.** The date is now taken in the exchange's time zone (`exchangeTimezoneName`), and a warning is printed for weekend-dated bars. The four series were refetched; the old files are in the trash.
+
+After the fix, the summer NQ=F session return correlates 0.85 with the Nasdaq close of the same US day, against −0.13 before. The winter correlation is 0.89 both before and after.
+
+**The scores.** The run is `stock_score_usret.py panel premask` (seeds 0..39) on the corrected data. Rerun on the old files, the same script reproduces the old forecasts bit-exactly, so the differences below come from the data alone. All differences are paired on the same 112,853 stock-days.
+
+| model | old data | corrected | corrected − old | EDT months | EST months |
+|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | +7.8e-4 ± 2.4e-4 | 0 | | |
+| ridge (MSE, 55 inputs) | +14.7e-4 ± 2.0e-4 | +13.9e-4 ± 2.0e-4 | −0.8e-4 ± 0.9e-4 | −1.2e-4 ± 1.2e-4 | +0.3e-4 ± 0.8e-4 |
+| 55-input set model, pre-open mask | +18.2e-4 ± 2.1e-4 | +16.0e-4 ± 2.1e-4 | −2.1e-4 ± 0.9e-4 | −3.3e-4 ± 1.2e-4 | +0.4e-4 ± 1.1e-4 |
+| 74-input set model, pre-open mask | +19.7e-4 ± 2.0e-4 | +18.6e-4 ± 2.0e-4 | −1.1e-4 ± 0.8e-4 | −1.3e-4 ± 1.0e-4 | −0.7e-4 ± 1.1e-4 |
+
+Per year on corrected data (2022 / 2023 / 2024 / 2025 / 2026):
+- ridge: +11.9 / +8.2 / +13.8 / +17.7 / +20.1 (e-4);
+- 55-input model: +12.9 / +11.6 / +15.0 / +16.6 / +28.2 (e-4);
+- 74-input model: +17.9 / +13.0 / +17.4 / +17.3 / +32.1 (e-4).
+
+About 8% of the forecast signs change.
+
+Observations:
+- **The leak inflated the earlier scores, mostly in the EDT months.** The 55-input model loses −3.3e-4 ± 1.2e-4 there and nothing in the EST months.
+- **The gain of the 74-input model over the 55-input model grows on clean data**, from +1.6e-4 ± 0.6e-4 to +2.6e-4 ± 0.6e-4. The US peer return and the panel columns thus partly replace what the leaked bar gave.
+- **The gap forecast is not affected.** Its out-of-sample R² on the opening gap rises slightly, from 0.478 to 0.481.
+- **Which earlier results used the leaked bars:** every earlier E1–E4w result built on `stock_recurrent.base_features` (through `stock_overnight.yahoo_features`). Comparisons within a run (paired differences between variants) shared the same data and remain valid as comparisons. The absolute levels are about 1e-4 (74-input) to 2e-4 (55-input) too high.
+- **From here on, the reference levels are the corrected ones:** 74-input model +18.6e-4, 55-input model +16.0e-4, ridge +13.9e-4.
+
+Files: `demo/runs/e4s_panel_premask_pred_dstfix.npz` and `demo/runs/stock_score_usret_panel_premask_dstfix.log`. The old-data forecasts stay in `demo/runs/e4s_panel_premask_pred.npz`.
+
+### E4y: a ceiling for a stock-level pre-open price, the day-trading share, and fresher US index series (`demo/stock_score_newfeat.py`)
+
+The base is the 74-input model under the pre-open mask, on the corrected data of E4x. It reproduces E4x bit for bit. All variants use seeds 0..39 and are paired with the base on the same seeds and data.
+- **Oracle opening gap (a diagnostic, not a usable model):** g = log(open_t / close_{t−1}) of every stock and |g| are added as two inputs. This uses the open of t. It bounds what a perfect stock-level pre-open price, such as the 08:30–09:00 simulated match, could add. The attention mask is unchanged.
+- **Day-trading share (3 inputs):** the day-trading volume over the total volume of t − 1 (FinMind TaiwanStockDayTrading over `price:成交股數`, both in shares), its 5-day mean, and its deviation from the 20-day mean. All are shifted one trading day; clipped and filled as the panel columns. Control: the same inputs from another day of the same year.
+- **Fresher US index series:** the poly features of ^IXIC and ^GSPC from `dataset/global` use the row dated t instead of the row before t. The row dated t holds the previous US close, known by 05:00 Taipei, so the input moves from the US session of t − 2 to that of t − 1. ^TWII, ^KS11 and TX_OI are unchanged.
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.1e-4 ± 2.5e-4 | — | +3.4e-4 ± 2.3e-4 | — | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +13.9e-4 ± 2.0e-4 | 0 | — | +10.8e-4 ± 1.9e-4 | — | 0.384 | +11.9e-4 | +8.2e-4 | +13.8e-4 | +17.7e-4 | +20.1e-4 |
+| set, 74-input base | +18.6e-4 ± 2.0e-4 | +4.7e-4 ± 1.1e-4 | — | +15.9e-4 ± 1.9e-4 | — | 0.469 | +17.9e-4 | +13.0e-4 | +17.4e-4 | +17.3e-4 | +32.1e-4 |
+| + oracle opening gap (uses the open) | +19.3e-4 ± 2.0e-4 | +5.4e-4 ± 1.1e-4 | +0.7e-4 ± 0.5e-4 | +16.4e-4 ± 1.8e-4 | +0.5e-4 ± 0.5e-4 | 0.471 | +17.5e-4 | +14.1e-4 | +17.4e-4 | +18.1e-4 | +34.6e-4 |
+| + day-trading share (3) | +19.0e-4 ± 2.0e-4 | +5.1e-4 ± 1.1e-4 | +0.4e-4 ± 0.4e-4 | +16.1e-4 ± 1.8e-4 | +0.3e-4 ± 0.4e-4 | 0.490 | +18.7e-4 | +13.2e-4 | +17.9e-4 | +17.4e-4 | +32.2e-4 |
+| + day-trading share of another day (control) | +18.4e-4 ± 2.0e-4 | +4.5e-4 ± 1.0e-4 | −0.3e-4 ± 0.4e-4 | +15.3e-4 ± 1.8e-4 | −0.6e-4 ± 0.4e-4 | 0.476 | +18.1e-4 | +12.1e-4 | +17.6e-4 | +17.0e-4 | +31.5e-4 |
+| fresher US index series | +18.0e-4 ± 2.0e-4 | +4.1e-4 ± 1.1e-4 | −0.6e-4 ± 0.5e-4 | +15.6e-4 ± 1.9e-4 | −0.3e-4 ± 0.5e-4 | 0.465 | +16.0e-4 | +12.7e-4 | +16.7e-4 | +17.9e-4 | +31.3e-4 |
+
+Reading the table: the ± values are day-clustered standard errors, and the "−" columns are paired differences on the same stock-days. The per-year standard errors and paired differences are in `demo/runs/stock_score_newfeat.log`.
+
+Observations:
+- **The oracle ceiling is small.** Even the realized opening gap of every stock adds only +0.7e-4 ± 0.5e-4, and +0.5e-4 on the 50-stock subset. The gap forecast g_hat (out-of-sample R² 0.48 on the gap) already carries most of it, and the gap itself correlates only −0.07 with r.
+- **The pre-open quote is therefore not worth pursuing.** Recording the 08:30–09:00 simulated match through a brokerage API cannot add more than this.
+- **The day-trading share does not pass the bar.** It adds +0.4e-4 ± 0.4e-4, about one standard error. That is 0.7e-4 above its control, and every year is slightly positive. It is not a clear gain at 40 seeds.
+- **Fresher US index series are slightly worse** (−0.6e-4 ± 0.5e-4). The overnight US session already enters through the TSM, SOX and Nasdaq-futures returns, so the levels add nothing.
+- **Conclusion:** none of the three beats the base by two standard errors, and the 74-input model stays the reference.
+
+#### E4y confirm: the day-trading share on seeds 40..79, and pooled (`stock_score_newfeat.py confirm`)
+
+| model | seeds 40..79 | − 74-input base, seeds 40..79 | pooled 0..79 | − 74-input base, pooled |
+|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | — | +7.8e-4 ± 2.4e-4 | — |
+| ridge (MSE, 55 inputs) | +13.9e-4 ± 2.0e-4 | — | +13.9e-4 ± 2.0e-4 | — |
+| set, 74-input base | +18.1e-4 ± 2.0e-4 | 0 | +18.2e-4 ± 2.0e-4 | 0 |
+| + day-trading share (3) | +19.2e-4 ± 2.0e-4 | +1.1e-4 ± 0.4e-4 | +19.2e-4 ± 2.0e-4 | +1.0e-4 ± 0.3e-4 |
+| + day-trading share of another day (control) | +18.9e-4 ± 2.0e-4 | +0.8e-4 ± 0.4e-4 | +18.9e-4 ± 2.0e-4 | +0.7e-4 ± 0.3e-4 |
+
+"Pooled" sums the forecasts of the two seed sets per variant. The day-trading share minus its control, paired, is +0.6e-4 ± 0.3e-4 on seeds 0..39, +0.3e-4 ± 0.4e-4 on seeds 40..79, and +0.3e-4 ± 0.3e-4 pooled.
+
+- **Most of the gain does not come from the data.** The pooled gain over the base is 3 standard errors, but the control with the same three columns on permuted days gains +0.7e-4 ± 0.3e-4 itself. The day-trading share adds about +0.3e-4 beyond the control, one standard error.
+- **Adding a few columns of any kind helps this base slightly**, perhaps through the changed initialization or as noise regularization. Earlier gains of "+k inputs" should be read against such controls; E4p, E4s and E4u had them.
+
+### E4z: per-stock scheduled events — ex-dividend dates and monthly revenue (`demo/stock_score_events.py`, data from `demo/fetch_events.py`)
+
+Data: FinMind TaiwanStockDividend and TaiwanStockMonthRevenue for the 100 stocks (200 requests, not committed). Every input is known before 09:00 of t.
+
+- **Dividend (3 inputs):**
+  - a flag "t is an ex-date" (cash or stock);
+  - the cash dividend over the raw price of t − 1;
+  - a flag "an ex-date within t + 1 .. t + 5".
+
+  An event is used only from the first trading day after its announcement date. The data hold the announcement date and time; the median lead to the ex-date is 11 trading days.
+- **Monthly revenue (4 inputs):**
+  - year-over-year growth;
+  - month-over-month growth;
+  - the surprise, YoY minus its mean over the previous 12 months;
+  - a flag "first trading day after a release".
+
+  The data have no filing date, so month m is used from the first trading day after the 11th of m + 1, the day after the legal deadline.
+- **Control:** both groups from another day of the same year.
+
+All variants use seeds 0..39 and are paired with the base; the base reproduces E4x bit for bit.
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.1e-4 ± 2.5e-4 | — | +3.4e-4 ± 2.3e-4 | — | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +13.9e-4 ± 2.0e-4 | 0 | — | +10.8e-4 ± 1.9e-4 | — | 0.384 | +11.9e-4 | +8.2e-4 | +13.8e-4 | +17.7e-4 | +20.1e-4 |
+| set, 74-input base | +18.6e-4 ± 2.0e-4 | +4.7e-4 ± 1.1e-4 | — | +15.9e-4 ± 1.9e-4 | — | 0.469 | +17.9e-4 | +13.0e-4 | +17.4e-4 | +17.3e-4 | +32.1e-4 |
+| + dividend (3) | +19.3e-4 ± 2.0e-4 | +5.4e-4 ± 1.1e-4 | +0.7e-4 ± 0.5e-4 | +16.4e-4 ± 1.9e-4 | +0.6e-4 ± 0.5e-4 | 0.471 | +21.6e-4 | +13.5e-4 | +17.5e-4 | +16.8e-4 | +31.3e-4 |
+| + revenue (4) | +18.9e-4 ± 2.0e-4 | +5.0e-4 ± 1.1e-4 | +0.3e-4 ± 0.5e-4 | +16.4e-4 ± 1.9e-4 | +0.5e-4 ± 0.5e-4 | 0.470 | +18.6e-4 | +13.3e-4 | +17.6e-4 | +17.6e-4 | +31.9e-4 |
+| + dividend and revenue (7) | +19.8e-4 ± 2.0e-4 | +5.9e-4 ± 1.1e-4 | +1.1e-4 ± 0.6e-4 | +16.9e-4 ± 1.9e-4 | +1.1e-4 ± 0.6e-4 | 0.470 | +20.8e-4 | +13.7e-4 | +17.5e-4 | +17.7e-4 | +33.9e-4 |
+| + both of another day (control) | +19.3e-4 ± 2.0e-4 | +5.3e-4 ± 1.2e-4 | +0.6e-4 ± 0.6e-4 | +16.2e-4 ± 1.9e-4 | +0.4e-4 ± 0.6e-4 | 0.467 | +20.3e-4 | +12.8e-4 | +17.8e-4 | +17.4e-4 | +32.4e-4 |
+
+Reading the table: the ± values are day-clustered standard errors, and the "−" columns are paired differences on the same stock-days. Against the control, paired: both +0.5e-4 ± 0.5e-4, dividend +0.1e-4 ± 0.5e-4, revenue −0.3e-4 ± 0.6e-4. The per-year paired differences are in `demo/runs/stock_score_events.log`.
+
+Observations:
+- **No variant is two standard errors above the base, and none is clearly above its control.**
+- **The ex-date effect is real but small.** On the 558 ex-date stock-days of 2022–2026, r averages −0.57%, against −0.07% on other days. This is not an artifact of the adjusted prices: the adjustment factor changes overnight, so the open and close of t carry the same factor.
+  - The dividend model learns it: its up share on ex-dates falls from 0.30 to 0.07.
+  - But ex-dates are under 1% of the stock-days. Always down on them would add at most about +0.3e-4 to the score, which is the ceiling of this input.
+- **The rest of the dividend gain is in 2022** (+3.7e-4 ± 1.8e-4). It does not repeat in 2025–2026, and the control shows +2.4e-4 in 2022 too.
+- **Monthly revenue adds nothing.** The availability rule (the 12th of m + 1) is conservative, and the growth ratios have heavy tails.
+- **Conclusion:** the 74-input model stays the reference. With E4y this closes the per-stock pre-open price, day-trading, fresher US-level and scheduled-event lines.
+
+#### E4z confirm: the scheduled events on seeds 40..79, and pooled (`stock_score_events.py confirm`)
+
+| model | seeds 40..79 | − 74-input base, seeds 40..79 | pooled 0..79 | − 74-input base, pooled | − control, pooled |
+|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | — | +7.8e-4 ± 2.4e-4 | — | — |
+| ridge (MSE, 55 inputs) | +13.9e-4 ± 2.0e-4 | — | +13.9e-4 ± 2.0e-4 | — | — |
+| set, 74-input base | +18.1e-4 ± 2.0e-4 | 0 | +18.2e-4 ± 2.0e-4 | 0 | — |
+| + dividend (3) | +20.1e-4 ± 2.0e-4 | +2.1e-4 ± 0.6e-4 | +19.9e-4 ± 2.0e-4 | +1.7e-4 ± 0.5e-4 | +0.5e-4 ± 0.5e-4 |
+| + revenue (4) | +18.9e-4 ± 2.0e-4 | +0.8e-4 ± 0.5e-4 | +19.0e-4 ± 2.0e-4 | +0.8e-4 ± 0.4e-4 | −0.4e-4 ± 0.5e-4 |
+| + dividend and revenue (7) | +20.2e-4 ± 2.0e-4 | +2.2e-4 ± 0.7e-4 | +20.0e-4 ± 2.0e-4 | +1.9e-4 ± 0.6e-4 | +0.7e-4 ± 0.5e-4 |
+| + both of another day (control) | +19.2e-4 ± 2.0e-4 | +1.1e-4 ± 0.6e-4 | +19.4e-4 ± 2.0e-4 | +1.2e-4 ± 0.6e-4 | 0 |
+
+"Pooled" sums the forecasts of the two seed sets per variant. The control is that of the 7 columns.
+
+The pooled per-year differences to the base (2022 / 2023 / 2024 / 2025 / 2026):
+- dividend: +5.6 ± 2.0, +0.6 ± 0.5, +0.5 ± 0.6, +0.1 ± 0.5, +1.6 ± 1.2 (e-4);
+- control: +3.4 ± 1.9, +0.2 ± 0.7, +0.5 ± 0.6, +0.4 ± 0.7, +1.6 ± 2.0 (e-4).
+
+- **The dividend gain is larger on the new seeds.** It is +2.1e-4 on seeds 40..79, and pooled +1.7e-4 ± 0.5e-4 over the base, more than three standard errors.
+- **Against the control the evidence is weaker.** The control alone gains +1.2e-4 pooled. The dividend inputs beat it by +0.5e-4 ± 0.5e-4, and both groups together by +0.7e-4 ± 0.5e-4, so only about one standard error is attributable to the event data.
+- **The gain is concentrated in 2022** (+5.6e-4 ± 2.0e-4). The control has +3.4e-4 there as well.
+- **Monthly revenue stays below its control.**
+- **Conclusion:** the dividend group is the most promising of the new inputs, but by the rule used here (two standard errors above the control) it is not adopted. The bound from E4z, about +0.3e-4 from the ex-dates themselves, also limits what it can add. Most of the gain over the base is the extra-columns effect seen in E4y confirm.
+
+#### E4z on 160 seeds (`stock_score_events.py seeds=80-119`, `seeds=120-159`; pooled by `demo/stock_score_pool.py e4z`)
+
+| model | sign score (100), 160 seeds | − ridge | − 74-input base | − control |
+|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.1e-4 ± 2.5e-4 | — | — |
+| ridge (MSE, 55 inputs) | +13.9e-4 ± 2.0e-4 | 0 | — | — |
+| set, 74-input base | +18.4e-4 ± 2.0e-4 | +4.5e-4 ± 1.0e-4 | 0 | — |
+| + dividend (3) | +19.3e-4 ± 2.0e-4 | +5.4e-4 ± 1.1e-4 | +0.9e-4 ± 0.3e-4 | +0.2e-4 ± 0.4e-4 |
+| + revenue (4) | +19.0e-4 ± 2.0e-4 | +5.1e-4 ± 1.1e-4 | +0.6e-4 ± 0.3e-4 | −0.0e-4 ± 0.5e-4 |
+| + dividend and revenue (7) | +19.8e-4 ± 2.0e-4 | +5.9e-4 ± 1.2e-4 | +1.4e-4 ± 0.4e-4 | +0.8e-4 ± 0.5e-4 |
+| + both of another day (control) | +19.1e-4 ± 2.0e-4 | +5.2e-4 ± 1.1e-4 | +0.7e-4 ± 0.4e-4 | 0 |
+
+- **Both − control is the cleanest comparison**, because both models have 81 inputs and hence the same initial draws (see E5a). It is +0.5, +1.0, +0.2 and +0.9 (e-4) on the four seed sets, +0.8e-4 ± 0.5e-4 pooled: 1.5 standard errors.
+- **Dividend − control is +0.2e-4 ± 0.4e-4.**
+- **Conclusion:** the events are not adopted.
+
+### E5a: why extra columns of noise raise the score (`demo/stock_score_extracols.py`)
+
+E4y confirm and E4z found that a control with real columns on permuted days gains +0.7e-4 to +1.2e-4 over the base. Four mechanisms were tested:
+- (a) regularization by the noise inputs;
+- (b) the initialization: the extra input columns change the random draws of all other weights;
+- (c) capacity;
+- (d) chance.
+
+All variants use seeds 0..159 (four sets of 40) and are paired with the 74-input base.
+
+`stock_score_fast.py` gained optional arguments:
+- `n_aligned`: the weights of the 74-input model drawn exactly as in the base, with the extra input weights from a separate generator;
+- `in_noise`: Gaussian noise on the standardized inputs during training;
+- `in_drop`: input dropout during training;
+- `init_scale`.
+
+With the defaults the forecasts are bit-identical to the earlier runs.
+
+Pooled over seeds 0..79 (the per-set tables are in `demo/runs/stock_score_extracols*.log`):
+
+| model | sign score (100) | − ridge | − 74-input base | sign score (50) | − 74-input base (50) | up share | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| always down | +7.8e-4 ± 2.4e-4 | −6.1e-4 ± 2.5e-4 | — | +3.4e-4 ± 2.3e-4 | — | 0.000 | +6.7e-4 | +3.3e-4 | +8.2e-4 | +9.0e-4 | +13.9e-4 |
+| ridge (MSE, 55 inputs) | +13.9e-4 ± 2.0e-4 | 0 | — | +10.8e-4 ± 1.9e-4 | — | 0.384 | +11.9e-4 | +8.2e-4 | +13.8e-4 | +17.7e-4 | +20.1e-4 |
+| set, 74-input base | +18.2e-4 ± 2.0e-4 | +4.3e-4 ± 1.0e-4 | — | +15.6e-4 ± 1.9e-4 | — | 0.474 | +16.8e-4 | +12.8e-4 | +17.3e-4 | +16.9e-4 | +31.7e-4 |
+| + 3 noise columns | +18.9e-4 ± 2.0e-4 | +5.0e-4 ± 1.1e-4 | +0.7e-4 ± 0.3e-4 | +16.3e-4 ± 1.9e-4 | +0.8e-4 ± 0.3e-4 | 0.474 | +18.5e-4 | +13.3e-4 | +17.9e-4 | +16.7e-4 | +32.8e-4 |
+| + 7 noise columns | +19.3e-4 ± 2.0e-4 | +5.4e-4 ± 1.1e-4 | +1.1e-4 ± 0.5e-4 | +16.2e-4 ± 1.9e-4 | +0.6e-4 ± 0.4e-4 | 0.467 | +21.1e-4 | +12.8e-4 | +17.6e-4 | +16.8e-4 | +32.7e-4 |
+| + 20 noise columns | +18.6e-4 ± 2.0e-4 | +4.6e-4 ± 1.1e-4 | +0.4e-4 ± 0.3e-4 | +15.9e-4 ± 1.9e-4 | +0.3e-4 ± 0.4e-4 | 0.467 | +19.0e-4 | +12.0e-4 | +17.3e-4 | +16.8e-4 | +32.4e-4 |
+| + 7 zero columns | +19.7e-4 ± 2.0e-4 | +5.8e-4 ± 1.2e-4 | +1.5e-4 ± 0.4e-4 | +16.7e-4 ± 1.9e-4 | +1.2e-4 ± 0.4e-4 | 0.474 | +21.5e-4 | +12.7e-4 | +17.7e-4 | +17.2e-4 | +34.0e-4 |
+| + 7 zero columns, aligned init | +18.2e-4 ± 2.0e-4 | +4.3e-4 ± 1.0e-4 | 0 (bit-identical) | +15.6e-4 ± 1.9e-4 | 0 | 0.474 | +16.8e-4 | +12.8e-4 | +17.3e-4 | +16.9e-4 | +31.7e-4 |
+| + 7 noise columns, aligned init | +18.3e-4 ± 2.0e-4 | +4.3e-4 ± 1.0e-4 | +0.1e-4 ± 0.2e-4 | +15.5e-4 ± 1.8e-4 | −0.0e-4 ± 0.3e-4 | 0.469 | +17.4e-4 | +12.3e-4 | +17.7e-4 | +17.0e-4 | +31.3e-4 |
+| input noise σ 0.1 | +17.8e-4 ± 2.0e-4 | +3.8e-4 ± 1.0e-4 | −0.4e-4 ± 0.2e-4 | +15.4e-4 ± 1.9e-4 | −0.2e-4 ± 0.2e-4 | 0.471 | +15.7e-4 | +12.4e-4 | +17.0e-4 | +17.1e-4 | +31.2e-4 |
+| input noise σ 0.3 | +18.3e-4 ± 2.0e-4 | +4.4e-4 ± 1.1e-4 | +0.1e-4 ± 0.3e-4 | +15.5e-4 ± 1.9e-4 | −0.1e-4 ± 0.3e-4 | 0.473 | +15.9e-4 | +12.6e-4 | +17.7e-4 | +17.3e-4 | +33.0e-4 |
+| input dropout 0.1 | +19.0e-4 ± 2.0e-4 | +5.1e-4 ± 1.1e-4 | +0.8e-4 ± 0.3e-4 | +16.2e-4 ± 1.9e-4 | +0.6e-4 ± 0.3e-4 | 0.462 | +20.0e-4 | +12.9e-4 | +16.9e-4 | +17.7e-4 | +31.9e-4 |
+
+Key paired differences:
+
+| pair | pooled 80 seeds | pooled 160 seeds |
+|---|---|---|
+| 7 zero columns aligned − base (capacity) | 0, bit-identical | 0, bit-identical |
+| 7 zero columns − 7 zero columns aligned (the reshuffled init alone) | +1.5e-4 ± 0.4e-4 | +1.1e-4 ± 0.3e-4 |
+| 7 noise columns − 7 zero columns (the noise alone, same init) | −0.4e-4 ± 0.2e-4 | −0.7e-4 ± 0.2e-4 |
+| 7 noise columns aligned − base | +0.1e-4 ± 0.2e-4 | +0.0e-4 ± 0.2e-4 |
+| input noise σ 0.1 − base | −0.4e-4 ± 0.2e-4 | −0.5e-4 ± 0.2e-4 |
+| input dropout 0.1 − base | +0.8e-4 ± 0.3e-4 | +0.5e-4 ± 0.2e-4 (sets +0.5 / +0.4 / −0.3 / +0.7) |
+
+Observations:
+- **Capacity (c) contributes exactly nothing.** With aligned init, zero columns leave the forecasts bit-identical in all four seed sets: inert inputs get no gradient.
+- **The noise itself (a) does not help.** At the same init, noise columns are worse than zero columns (−0.7e-4 ± 0.2e-4 over 160 seeds). Aligned noise columns equal the base, and training-time input noise is flat or harmful.
+- **The whole effect is the reshuffled initial draws (b).** They give +1.1e-4 ± 0.3e-4 over 160 seeds, but with a large spread between the seed sets (0.0, +1.6, +0.4, +1.2) and mostly in 2022, the fold with the shortest history. A smaller init bound (1/√81 against 1/√74) explains only a minor part.
+- **Chance (d) adds to it.** The base of seeds 40..79 is a low draw in 2022, 2–3e-4 below the other three base ensembles. That is why every control "won" in E4y confirm and E4z confirm.
+- **Not settled:** a reshuffle of random draws should have no systematic effect, yet it reaches 3.8 standard errors over 160 seeds. Either the ensemble variance of the 2022 fold is larger than its standard error shows, or the initialization matters systematically when training is short.
+- **Rule for future input tests:** compare against a control with the same number of columns (identical init draws), or use the aligned init. A difference "+k columns − base" mixes the data with the initialization.
+- **Input dropout p = 0.1 is the only no-data change above two standard errors:** +0.5e-4 ± 0.2e-4 over 160 seeds, positive in three of the four sets and strongest in 2022. It is small. Other dropout rates were not tried yet.

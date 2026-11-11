@@ -14,6 +14,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -45,6 +46,18 @@ def taifex():
     f.to_csv(OUT / "taifex_tx.csv", index=False)
 
 
+def bar_dates(res, sym):
+    """Date of each daily bar in the exchange's own time zone (DST-aware). A fixed res["meta"]["gmtoffset"] is the
+    offset of the fetch day only: series stamped 00:00 local (futures, FX) then get the previous day in the other
+    DST regime."""
+    tz = ZoneInfo(res["meta"]["exchangeTimezoneName"])
+    d = pd.to_datetime(res["timestamp"], unit="s", utc=True).tz_convert(tz)
+    wkend = int((d.dayofweek >= 5).sum())
+    if wkend:
+        print(f"WARNING {sym}: {wkend} weekend-dated bars ({tz})", flush=True)
+    return d.strftime("%Y-%m-%d")
+
+
 def yahoo(sym):
     p1, p2 = int(pd.Timestamp(START).timestamp()), int(pd.Timestamp(END).timestamp())
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(sym)}?period1={p1}&period2={p2}"
@@ -52,8 +65,7 @@ def yahoo(sym):
     res = json.loads(urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60).read())["chart"]
     res = res["result"][0]
     q = res["indicators"]["quote"][0]
-    off = res["meta"]["gmtoffset"]
-    f = pd.DataFrame({"date": pd.to_datetime([t + off for t in res["timestamp"]], unit="s").strftime("%Y-%m-%d"),
+    f = pd.DataFrame({"date": bar_dates(res, sym),
                       "open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"],
                       "volume": q["volume"]})
     if "adjclose" in res["indicators"]:

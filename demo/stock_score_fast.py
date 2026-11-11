@@ -42,12 +42,29 @@ KEYS = ("cur.weight", "cur.bias", "enc.self_attn.in_proj_weight", "enc.self_attn
         "enc.norm2.bias", "out.weight", "out.bias")
 
 
-def init_bank(seeds, n_in, d, dropout=0.2):
-    """stacked initial weights (K, ...) of TokNet built after torch.manual_seed(seed) for each seed."""
+def init_bank(seeds, n_in, d, dropout=0.2, n_aligned=None, init_scale=None):
+    """stacked initial weights (K, ...) of TokNet built after torch.manual_seed(seed) for each seed.
+    Optional n_aligned < n_in: every weight is that of the TokNet with n_aligned inputs (the first n_aligned input
+    columns of cur.weight included), and the n_in - n_aligned extra columns of cur.weight are drawn from a separate
+    CPU generator (seed 1000003 + seed), uniform with the same bound 1/sqrt(n_aligned); the global RNG draws are
+    those of the n_aligned-input model. Optional init_scale: cur.weight and cur.bias multiplied by it after the draws."""
     sds = []
     for s in seeds:
         torch.manual_seed(s)
-        sds.append(it.TokNet(0, n_in, "e4h", d, False, dropout=dropout).state_dict())
+        if n_aligned is None or n_aligned == n_in:
+            sds.append(it.TokNet(0, n_in, "e4h", d, False, dropout=dropout).state_dict())
+            if init_scale is not None:
+                sds[-1]["cur.weight"] = sds[-1]["cur.weight"] * init_scale
+                sds[-1]["cur.bias"] = sds[-1]["cur.bias"] * init_scale
+            continue
+        sd = it.TokNet(0, n_aligned, "e4h", d, False, dropout=dropout).state_dict()
+        g = torch.Generator().manual_seed(1000003 + s)
+        b = 1.0 / n_aligned ** 0.5
+        extra = (torch.rand(d, n_in - n_aligned, generator=g) * 2 - 1) * b
+        sd["cur.weight"] = torch.cat([sd["cur.weight"], extra], 1)
+        if init_scale is not None:
+            sd["cur.weight"], sd["cur.bias"] = sd["cur.weight"] * init_scale, sd["cur.bias"] * init_scale
+        sds.append(sd)
     return {k: nn.Parameter(torch.stack([sd[k] for sd in sds]).to(DEV)) for k in KEYS}
 
 
@@ -77,18 +94,34 @@ def forward(P, z, att, train, p=0.2, heads=4):
     return torch.einsum("kbsd,kod->kbso", x, P["out.weight"])[..., 0] + P["out.bias"][:, None, None, 0]
 
 
-def soft_loss(f, y, m):
-    """per seed: -sum(tanh(f) y) / sum|y| over the usable rows m; f (K, B, S), y and m (K or 1, B, S)."""
+def soft_loss(f, y, m, k=1.0, w=None):
+    """per seed: -sum(tanh(f) y) / sum|y| over the usable rows m; f (K, B, S), y and m (K or 1, B, S).
+    Optional: k, the loss uses tanh(k f); w (K, B, 1), day weights in the numerator only (the denominator stays the
+    unweighted sum|y|, so that weights of mean 1 keep the scale of the loss). The defaults give the original loss."""
     mf = m.float()
-    return -(torch.tanh(f) * y * mf).sum((1, 2)) / (y.abs() * mf).sum((1, 2)).clamp_min(1e-12)
+    if k == 1.0 and w is None:
+        return -(torch.tanh(f) * y * mf).sum((1, 2)) / (y.abs() * mf).sum((1, 2)).clamp_min(1e-12)
+    t = torch.tanh(f) if k == 1.0 else torch.tanh(k * f)
+    num = t * y * mf if w is None else t * y * mf * w
+    return -num.sum((1, 2)) / (y.abs() * mf).sum((1, 2)).clamp_min(1e-12)
 
 
 def train_bank(seeds, Z, Y, M, ATT, days, d=32, epochs=None, vdays=None, lr=1e-3, wd=1e-2, bsz=16, dropout=0.2,
-               max_epochs=40, patience=3):
+               max_epochs=40, patience=3, kt=1.0, dw=None, in_noise=0.0, in_drop=0.0, n_aligned=None,
+               init_scale=None):
     """Z (T, S, F) standardized inputs on the GPU. Selection (epochs None, vdays given): returns the best epoch of
-    every seed. Refit (epochs = list per seed): returns the weights of every seed after its own epoch count."""
+    every seed. Refit (epochs = list per seed): returns the weights of every seed after its own epoch count.
+    Optional: kt, the loss and the validation loss use tanh(kt f); dw (T,) day weights of the training loss (the
+    validation loss stays unweighted); in_noise, N(0, in_noise^2) added to the standardized inputs of the training
+    batches; in_drop, each input of the training batches set to 0 with probability in_drop and the rest scaled by
+    1 / (1 - in_drop) (both from a separate CUDA generator, seed 5003 + the first seed, so that the dropout masks of the
+    network are drawn as without them; never in the validation or the forecast); n_aligned and init_scale, see
+    init_bank. The
+    defaults give the original trainer."""
     K = len(seeds)
-    P = init_bank(seeds, Z.shape[-1], d, dropout)
+    P = (init_bank(seeds, Z.shape[-1], d, dropout) if n_aligned is None and init_scale is None else
+         init_bank(seeds, Z.shape[-1], d, dropout, n_aligned, init_scale))
+    ng = torch.Generator(device=DEV).manual_seed(5003 + seeds[0]) if in_noise > 0 or in_drop > 0 else None
     opt = torch.optim.AdamW(list(P.values()), lr=lr, weight_decay=wd)
     gens = [torch.Generator(device=DEV).manual_seed(s) for s in seeds]
     n_ep = max_epochs if epochs is None else int(max(epochs))
@@ -102,8 +135,17 @@ def train_bank(seeds, Z, Y, M, ATT, days, d=32, epochs=None, vdays=None, lr=1e-3
         perms = torch.stack([days[torch.randperm(len(days), device=DEV, generator=g)] for g in gens])  # (K, n)
         for i in range(0, perms.shape[1], bsz):
             b = perms[:, i:i + bsz]
-            f = forward(P, Z[b], ATT[b], True, dropout)
-            loss = soft_loss(f, Y[b], M[b]).sum()
+            if ng is None:
+                f = forward(P, Z[b], ATT[b], True, dropout)
+            else:
+                z = Z[b]
+                if in_noise > 0:
+                    z = z + in_noise * torch.randn(z.shape, device=DEV, generator=ng)
+                if in_drop > 0:
+                    z = z * ((torch.rand(z.shape, device=DEV, generator=ng) >= in_drop).float() / (1 - in_drop))
+                f = forward(P, z, ATT[b], True, dropout)
+            loss = (soft_loss(f, Y[b], M[b]) if kt == 1.0 and dw is None else
+                    soft_loss(f, Y[b], M[b], kt, None if dw is None else dw[b][..., None])).sum()
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -120,7 +162,7 @@ def train_bank(seeds, Z, Y, M, ATT, days, d=32, epochs=None, vdays=None, lr=1e-3
                 b = vdays[i:i + 64][None]
                 f = forward(P, Z[b], ATT[b], False)
                 mf = M[b].float()
-                num += (torch.tanh(f) * Y[b] * mf).sum((1, 2))
+                num += ((torch.tanh(f) if kt == 1.0 else torch.tanh(kt * f)) * Y[b] * mf).sum((1, 2))
                 den += (Y[b].abs() * mf).sum()
             v = -num / den
             imp = (v < best) & ~done
@@ -144,10 +186,14 @@ def predict(snap, Z, ATT, tdays):
         return torch.cat(out).cpu().numpy()   # (n_days, S), summed over the seeds
 
 
-def fit_predict(seeds, inp_s, inp_r, Y, M, ATT, d_in, d_sel, d_rows, d_te, d=32):
-    """selection on inp_s (early stopping on d_sel), refit on inp_r, forecast of d_te; returns (sum f, epochs)."""
-    eps = [max(e, 1) for e in train_bank(seeds, inp_s.cur, Y, M, ATT, d_in, d=d, vdays=d_sel)]
-    snap = train_bank(seeds, inp_r.cur, Y, M, ATT, d_rows, d=d, epochs=eps)
+def fit_predict(seeds, inp_s, inp_r, Y, M, ATT, d_in, d_sel, d_rows, d_te, d=32, dropout=0.2, kt=1.0, dw_s=None,
+                dw_r=None, **kw):
+    """selection on inp_s (early stopping on d_sel), refit on inp_r, forecast of d_te; returns (sum f, epochs).
+    Optional: dropout, kt (tanh(kt f) in the loss) and the day weights of the selection fit (dw_s) and the refit (dw_r);
+    kw (in_noise, in_drop, n_aligned, init_scale) goes to both fits of train_bank."""
+    eps = [max(e, 1) for e in train_bank(seeds, inp_s.cur, Y, M, ATT, d_in, d=d, vdays=d_sel, dropout=dropout, kt=kt,
+                                         dw=dw_s, **kw)]
+    snap = train_bank(seeds, inp_r.cur, Y, M, ATT, d_rows, d=d, epochs=eps, dropout=dropout, kt=kt, dw=dw_r, **kw)
     return predict(snap, inp_r.cur, ATT, d_te), eps
 
 
